@@ -84,6 +84,23 @@ class Agent:
     log_dir: str | Path | None = None
     sessions: SessionStore = field(default_factory=MemorySessionStore, repr=False, compare=False)
 
+    def get_flow_graph(self, *, direction: str = "LR") -> str:
+        """Return Mermaid for a Flow or a loop exposing to_flow()."""
+        from .viz import build_mermaid
+
+        return build_mermaid(self.loop, direction=direction)
+
+    def get_flow_graph_png(self, filename: str | Path, *, direction: str = "LR") -> Path:
+        from .viz import to_png
+
+        return to_png(self.loop, filename, direction=direction)
+
+    def render_graph(self, filename: str | Path, *, direction: str = "LR") -> Path:
+        """Save a PNG/SVG locally using Graphviz."""
+        from .viz import render_graph
+
+        return render_graph(self.loop, filename, direction=direction)
+
     async def run(
         self,
         prompt: str,

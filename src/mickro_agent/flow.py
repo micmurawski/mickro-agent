@@ -6,6 +6,7 @@ import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -140,6 +141,21 @@ class Flow:
         for (source, _), target in self.edges.items():
             if source not in self.nodes or (target != END and target not in self.nodes):
                 raise ValueError(f"Invalid edge: {source!r} -> {target!r}")
+
+    def to_mermaid(self, *, direction: str = "LR") -> str:
+        from .viz import build_mermaid
+
+        return build_mermaid(self, direction=direction)
+
+    def to_dot(self, *, direction: str = "LR") -> str:
+        from .viz import build_dot
+
+        return build_dot(self, direction=direction)
+
+    def render(self, filename: str | Path, *, direction: str = "LR") -> Path:
+        from .viz import render_graph
+
+        return render_graph(self, filename, direction=direction)
 
     async def run(self, runtime: Runtime) -> None:
         current = self.start

@@ -45,8 +45,11 @@ def react_flow(*, tool_concurrency: int = 1) -> Flow:
 class ReAct:
     tool_concurrency: int = 1
 
+    def to_flow(self) -> Flow:
+        return react_flow(tool_concurrency=self.tool_concurrency)
+
     async def run(self, runtime: Runtime) -> None:
-        await react_flow(tool_concurrency=self.tool_concurrency).run(runtime)
+        await self.to_flow().run(runtime)
 
 
 @dataclass(frozen=True)
@@ -55,7 +58,7 @@ class PlanThenAct:
     execution_prompt: str = "Execute the plan using the available tools, then give the result."
     tool_concurrency: int = 1
 
-    async def run(self, runtime: Runtime) -> None:
+    def to_flow(self) -> Flow:
         @node
         async def plan(runtime: Runtime) -> None:
             runtime.say(self.planning_prompt)
@@ -65,4 +68,7 @@ class PlanThenAct:
 
         call_llm = _react_nodes(self.tool_concurrency)
         plan >> call_llm
-        await Flow(start=plan).run(runtime)
+        return Flow(start=plan)
+
+    async def run(self, runtime: Runtime) -> None:
+        await self.to_flow().run(runtime)

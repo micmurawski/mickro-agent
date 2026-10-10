@@ -257,6 +257,45 @@ them as they happen, or use `Run.write_events()` for an explicit snapshot export
 Conversation continuation uses the session store described below; JSONL logs remain
 an execution trace, not the checkpoint format.
 
+## Print and render flow graphs
+
+The original agent graph API is available without running the agent:
+
+```python
+print(agent.get_flow_graph())  # Mermaid text
+agent.get_flow_graph_png("artifacts/agent.png")  # Requires local Graphviz
+agent.render_graph("artifacts/agent.svg")
+```
+
+Compiled DSL flows expose the same functionality directly:
+
+```python
+flow = Flow(start=call_llm)
+print(flow.to_mermaid(direction="TB"))
+print(flow.to_dot())
+flow.render("artifacts/flow.svg")
+```
+
+`ReAct().to_flow()` and `PlanThenAct().to_flow()` return the same graph definition
+used during execution. Custom loops can implement `to_flow() -> Flow` to support
+export; arbitrary Python loops without a graph raise a clear error. Graph export
+shows the compiled snapshot, including cycles, action labels, and actual END edges.
+Dashed edges are default transitions. Directions are `LR`, `RL`, `TB`, and `BT`.
+
+Mermaid and DOT export use only the core package. Paste Mermaid into a Mermaid
+viewer or a fenced `mermaid` Markdown block. PNG/SVG rendering uses Graphviz's
+`dot` executable on PATH (install Graphviz separately, e.g. `brew install graphviz`
+on macOS). Rendering runs locally; no diagram is sent to a hosted service.
+
+```sh
+PYTHONPATH=src python examples/print_graph.py
+PYTHONPATH=src python examples/print_graph.py --loop plan --format dot
+PYTHONPATH=src python examples/print_graph.py --output artifacts/react.svg
+```
+
+The functions `build_mermaid`, `build_dot`, `render_graph`, and the original
+`to_png` spelling are also available from `mickro_agent.viz` or the package root.
+
 ## Agents as tools
 
 Bind an agent configuration to a tool with `agent_tool(...)` (also exported as

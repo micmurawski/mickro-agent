@@ -22,6 +22,7 @@ from .types import (
     ToolCall,
     ToolSpec,
 )
+from .viz import build_dot, build_mermaid, render_graph, to_png
 
 __all__ = [
     "AGENT_JOB_TOOLS",
@@ -58,10 +59,14 @@ __all__ = [
     "Tools",
     "agent_call_tool_factory",
     "agent_tool",
+    "build_dot",
+    "build_mermaid",
     "finish_step",
     "model_step",
     "node",
     "react_flow",
+    "render_graph",
+    "to_png",
     "tool",
     "tools_step",
 ]
