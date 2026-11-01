@@ -8,32 +8,13 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .history import validate_history as _validate_history
 from .loops import ReAct
 from .runtime import LimitReached, Loop, Provider, Runtime
 from .session_log import SessionLog, SessionLogError, validate_session_id
 from .sessions import MemorySessionStore, Session, SessionStore
 from .tools import Tools
 from .types import Limits, Message, Run
-
-
-def _validate_history(history: Sequence[Message]) -> None:
-    pending: set[str] = set()
-    for message in history:
-        if message.role == "system":
-            raise ValueError("Set system_prompt on Agent; history must not include system messages")
-        if message.role == "tool":
-            if message.tool_call_id not in pending:
-                raise ValueError("History contains an unmatched tool result")
-            pending.remove(message.tool_call_id)
-        else:
-            if pending:
-                raise ValueError("History contains unresolved tool calls")
-            ids = [call.id for call in message.tool_calls]
-            if len(ids) != len(set(ids)):
-                raise ValueError("History contains duplicate tool call IDs")
-            pending.update(ids)
-    if pending:
-        raise ValueError("History contains unresolved tool calls")
 
 
 def _errors(exc: Exception) -> list[Exception]:
@@ -54,7 +35,7 @@ def _checkpoint_messages(run: Run) -> tuple[Message, ...]:
     # A parallel batch may have returned some results before a sibling failed.
     observed = {}
     for event in run.events:
-        if event.kind == "model_response":
+        if event.kind == "model_response" and event.data.get("conversation", True):
             observed.clear()
         elif event.kind == "tool_result":
             observed[event.data["message"]["tool_call_id"]] = event.data["message"]

@@ -257,6 +257,197 @@ them as they happen, or use `Run.write_events()` for an explicit snapshot export
 Conversation continuation uses the session store described below; JSONL logs remain
 an execution trace, not the checkpoint format.
 
+## Explicit context compaction
+
+Compaction changes what subsequent model calls and session continuations see,
+while retaining the full execution trace in events. It is opt-in; existing loops
+keep their current behavior. Mark the boundary after the user's request and before
+a temporary planning/review phase, then compact after that phase has finished:
+
+```python
+from mickro_agent import Replace
+
+# In a node before plan -> review -> test assumptions -> final plan:
+runtime.run.state["planning_start"] = runtime.mark_messages()
+
+# In a later node, after generating a complete execution handoff:
+result = await runtime.compact_since(
+    runtime.run.state.pop("planning_start"),
+    strategy=Replace(runtime.run.state["final_plan"]),
+)
+runtime.say("Execute the final plan, then report the result.")
+```
+
+Three built-in strategies implement the same asynchronous operation:
+
+| Strategy | Replacement | Additional model call |
+| --- | --- | --- |
+| `Remove()` | Nothing | No |
+| `Replace(text)` | A fresh assistant handoff message | No |
+| `Summarize(prompt=..., provider=...)` | A newly generated assistant summary | Yes |
+
+Use `Replace` when `final-plan` already produced the information execution needs.
+Use `Summarize` when that information still needs to be extracted from a longer
+conversation region. Its default prompt comes from incident-assistant: previous
+conversation, current work, technical concepts, relevant files/code, problem
+solving, and pending tasks/next steps. `Remove` explicitly
+discards the region; it does not undo external effects or refund usage.
+
+```python
+from mickro_agent import MessageRange, OlderHistory, Remove, Summarize
+
+# Summarize everything appended after an earlier marker.
+result = await runtime.compact_since(marker, strategy=Summarize())
+
+# Preserve the first user request and the latest three user-initiated turns.
+result = await runtime.compact(
+    selection=OlderHistory(keep_recent_turns=3),
+    strategy=Summarize(prompt="Preserve verified facts, decisions, and remaining work."),
+)
+
+# Explicit ranges can preserve newer messages after a stop marker.
+result = await runtime.compact(
+    selection=MessageRange(start_marker, stop_marker),
+    strategy=Remove(),
+)
+```
+
+These are separate usage patterns: an applied compaction invalidates all existing
+markers. Create new markers for subsequent regions. Markers belong to one Runtime,
+are not resumable checkpoints, and reject changes to their captured prefix.
+`OlderHistory` selects complete user-initiated turns: each user message and all
+following assistant/tool messages up to the next user message. Instructions added
+by `runtime.say()` count as user messages too. It always keeps the first user
+message and at least one recent turn. System messages cannot be replaced or inserted.
+
+The runtime requires complete tool-call/result groups at both boundaries and in
+the resulting conversation. Compaction is refused during pending tool calls,
+model requests or tool execution. A detached snapshot goes to the strategy;
+the proposal is validated before replacing live messages. Concurrent conversation
+changes cause rejection. Summary failure, cancellation, invalid replacement and
+log failures do not apply the proposal. There is no implicit removal fallback.
+
+Summarization defaults to the run's provider, or accepts `Summarize(provider=other)`.
+It uses a separate, tool-free request with `purpose="compact"`. The selected region
+is serialized as transcript data so another provider can read its tool calls and
+results without replaying native tool protocol or thinking blocks. Earlier context
+outside the region is not sent to the summarizer. Only the final summary is added
+to the main conversation; summarization instructions and transport metadata are
+not retained there. Include any extra task context in your custom prompt if needed.
+
+The call shares the run's model-call budget, deadline, global turn numbering and
+usage. Received usage chunks remain counted even if the stream later fails or the
+proposal is rejected. `model_request` and `model_response` events identify summary
+calls with `conversation=False`; regular turns use `conversation=True`. The
+`context_compaction` event records the removed region and replacement. Skipped
+and failed operations emit `context_compaction_skipped` and
+`context_compaction_failed` respectively after selection succeeds.
+
+`CompactionResult` exposes `applied`, `reason`, `strategy`, `start`, `stop`, and
+detached `replacement` messages. Empty selections and identical replacements are
+no-ops and do not invalidate markers. If an application supplies an async
+`token_counter(messages) -> int`, the runtime measures the full before/after
+conversation and applies only a strict reduction. A proposal that is not smaller
+returns `applied=False, reason="not_smaller"`. The result also exposes `before_tokens` and
+`after_tokens`. Without a counter, these are `None` and there is no token-reduction
+guarantee. The core provider protocol does not assume a tokenizer or context-window
+size. `ReAct` does not enable automatic compaction; use `ReActWithSummary` below
+to opt in.
+
+### ReAct with rolling summaries
+
+`SummaryHistory(keep_recent_messages=3)` ports the selection algorithm from
+`incident-assistant/agent/agent/context_ops.py`. It preserves the system prompt,
+the first conversation message, and at least the latest three **messages**.
+The recent tail expands when necessary to retain complete tool-call/result groups,
+including parallel calls. It skips if there is too little older history or a
+summary already appears in the retained tail. Unlike `OlderHistory`, this works
+within a long ReAct turn that has no additional user messages.
+
+`Summarize` includes the latest previous summary and everything after it in the
+selected region; older messages superseded by that summary are not sent again.
+The whole selected region is replaced by one fresh summary. Summary metadata
+survives session checkpoints, so this also works across resumed runs.
+
+```python
+from mickro_agent import ReActWithSummary, Summarize, SummaryHistory
+
+# Manual application of the legacy summary window:
+result = await runtime.compact(
+    selection=SummaryHistory(keep_recent_messages=3),
+    strategy=Summarize(prompt="Preserve evidence, decisions, and outstanding work."),
+    token_counter=count_tokens,
+)
+
+# Or pass this recipe as Agent(..., loop=loop):
+loop = ReActWithSummary(
+    context_window=128_000,
+    token_counter=count_tokens,  # Your async counter for the execution model.
+    threshold_percent=80,
+    max_output_tokens=8192,
+    keep_recent_messages=3,
+    summary=Summarize(
+        prompt="Preserve evidence, decisions, and outstanding work.",
+        # provider=summary_provider,  # Optional separate summarization model.
+    ),
+)
+```
+
+The flow is `summarize -> call_llm -> tools -> summarize`, or
+`call_llm -> finish` on a final answer. The summary node checks the full current
+conversation before the first model call and after each completed tool batch.
+It triggers at the configured percentage, or when input exceeds
+`context_window * 0.9 - max_output_tokens`, following the legacy buffer/reserve
+calculation. The output reserve is a budgeting input; configure the provider's
+generation limit separately. The required async counter receives canonical
+messages, including the system prompt; include tool-schema/request overhead in
+your counter as needed. Use the execution model's tokenizer even when the summary
+comes from another provider. These settings are explicit, not inferred model limits.
+
+The generated summary must reduce the full conversation's measured token count.
+Skipped or nonshrinking summaries leave history intact; provider errors propagate
+without applying a proposal. This ports the legacy **summarization** algorithm,
+not its separate automatic half-history deletion fallback or debug-file writes.
+The threshold is a trigger, not a guarantee that the next request fits: retained
+messages alone can exceed it. Use explicit removal/custom compaction if required.
+
+Run `python examples/react_with_summary.py` for an offline demonstration with
+verbose tool results and a scripted summarizer.
+
+Custom strategies implement `async compact(request) -> CompactionProposal`:
+
+```python
+from mickro_agent import CompactionProposal, Message
+
+class ExtractHandoff:
+    async def compact(self, request):
+        response = await request.generate_summary(
+            "Extract only confirmed decisions, evidence, and pending actions."
+        )
+        if not response.text.strip():
+            raise ValueError("Empty handoff")
+        return CompactionProposal((Message(role="assistant", content=response.text),))
+```
+
+`request.messages` contains detached source messages. Await `generate_summary`
+inside the strategy to use runtime accounting; it is valid only during that
+operation. Its optional `start_index` selects a suffix of the original source
+snapshot. A custom strategy should return its proposal without mutating Runtime
+or starting background work. Built-in summary/handoff messages use
+`metadata["compaction"]` and do not inherit provider-specific metadata.
+
+The offline example implements the complete phase graph and actual capacity checks:
+
+```sh
+python examples/planning_compaction.py
+python examples/planning_compaction.py --summarize
+```
+
+Successful checkpoints contain the compacted conversation; JSONL logs still contain
+the original planning exchanges. If a run fails during compaction, the original
+conversation remains available to checkpoint handling. Retain actions already taken
+and unknown outcomes in handoffs so continuation does not blindly repeat effects.
+
 ## Print and render flow graphs
 
 The original agent graph API is available without running the agent:

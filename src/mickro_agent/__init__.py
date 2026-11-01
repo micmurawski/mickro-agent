@@ -2,8 +2,22 @@
 
 from .agent import Agent
 from .agent_tools import AGENT_JOB_TOOLS, AgentJobs, agent_call_tool_factory, agent_tool
+from .context_ops import (
+    CompactionProposal,
+    CompactionRequest,
+    CompactionResult,
+    CompactionStrategy,
+    MessageMarker,
+    MessageRange,
+    OlderHistory,
+    Remove,
+    Replace,
+    Summarize,
+    SummaryHistory,
+    TokenCounter,
+)
 from .flow import END, Flow, Node, node
-from .loops import PlanThenAct, ReAct, finish_step, model_step, react_flow, tools_step
+from .loops import PlanThenAct, ReAct, ReActWithSummary, finish_step, model_step, react_flow, tools_step
 from .providers.base import ApiHandler
 from .runtime import Loop, Provider, Runtime
 from .session_log import SessionLogError
@@ -31,6 +45,10 @@ __all__ = [
     "AgentJobs",
     "ApiHandler",
     "ApiHandlerCreateMessageMetadata",
+    "CompactionProposal",
+    "CompactionRequest",
+    "CompactionResult",
+    "CompactionStrategy",
     "Event",
     "FileSessionStore",
     "Flow",
@@ -40,22 +58,31 @@ __all__ = [
     "MemorySessionStore",
     "Message",
     "MessageParam",
+    "MessageMarker",
+    "MessageRange",
     "ModelRequest",
     "ModelResponse",
     "Node",
+    "OlderHistory",
     "PlanThenAct",
     "Provider",
     "ReAct",
+    "ReActWithSummary",
+    "Remove",
+    "Replace",
     "Run",
     "Runtime",
     "Session",
     "SessionLogError",
     "SessionStore",
     "StreamChunk",
+    "Summarize",
+    "SummaryHistory",
     "Tool",
     "ToolCall",
     "ToolResult",
     "ToolSpec",
+    "TokenCounter",
     "Tools",
     "agent_call_tool_factory",
     "agent_tool",
