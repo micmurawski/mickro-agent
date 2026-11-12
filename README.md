@@ -120,7 +120,6 @@ providers/
     openai.py     # OpenAIChat: native streaming, including fragmented tool calls
     minimax.py    # MiniMax: Anthropic-compatible streaming and preserved thinking blocks
     scripted.py   # ScriptedProvider: offline, per-turn responses
-    legacy.py     # LegacyProvider: forwards the original handlers' streams
     streaming.py  # Shared response collector and stream cleanup
 ```
 
@@ -802,7 +801,7 @@ exercises Docker mounts and container removal.
 ## Migration from incident-assistant
 
 This is a selective migration, not a drop-in replacement. The original tree remains
-untouched. New code depends only on Pydantic; old integrations remain opt-in.
+untouched. New code depends only on Pydantic.
 
 | Original | New home |
 | --- | --- |
@@ -812,29 +811,12 @@ untouched. New code depends only on Pydantic; old integrations remain opt-in.
 | Provider-specific message shapes | Canonical `Message`, `ToolCall`, `ModelRequest`, `ModelResponse` |
 | `OpenAICompatibleHandler` | `OpenAIChat`, with injected configuration/client |
 | `ApiHandler.create_message(...) -> AsyncIterator[StreamChunk]` | Same streaming entry point; adapters in `mickro_agent.providers` |
-| Existing provider handlers | Opt-in `LegacyProvider` bridge |
 | Task histories and terminal prints | Per-run events, messages, usage, and result |
 
-Existing decorated tools and handlers can be reused in an environment where the
-old package and its dependencies are already importable:
-
-```python
-from mickro_agent import Agent, Tools
-from mickro_agent.legacy import LegacyProvider, migrate_tool
-
-# old_handler and old_tools are your existing configured objects.
-agent = Agent(
-    provider=LegacyProvider(old_handler),
-    tools=Tools(migrate_tool(item) for item in old_tools.tools),
-)
-run = await agent.run("Investigate the incident", context={"cwd": workspace, "env": environment})
-```
-
-Create a fresh legacy handler/adapter for each run: some original handlers retain
-conversation state. Their clients remain caller-owned. The bridge adapts complete
-streamed text/tool turns and usage, including Gemini tool signature metadata. It
-does not promise complete multimodal or provider-specific reasoning-block fidelity.
-Infrastructure tools still require their original clients and runtime dependencies.
+The original handlers and decorated tools are not bridged. Port them to the
+canonical APIs instead: implement `create_message()` on a provider class and
+define tools with `@tool` from `mickro_agent.tools`. Infrastructure tools still
+require their original clients and runtime dependencies.
 
 Kubernetes/Grafana tools, task delegation/feedback, ACE curation, database models,
 automatic summarization, and tracing backends have not been copied into the core.

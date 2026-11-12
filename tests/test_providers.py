@@ -4,7 +4,6 @@ from types import SimpleNamespace as NS
 import pytest
 
 from mickro_agent import Agent, Message, ModelRequest, ToolCall, Tools, ToolSpec, tool
-from mickro_agent.legacy import LegacyProvider, migrate_tool
 from mickro_agent.providers import OpenAIChat
 
 
@@ -94,68 +93,6 @@ def test_openai_planning_omits_tools_and_truncation_fails():
     with pytest.raises(ValueError, match="Incomplete"):
         asyncio.run(provider.complete(ModelRequest(messages=(), turn=1)))
     assert stream.closed
-
-
-def test_legacy_provider_groups_results_and_preserves_signatures():
-    class Handler:
-        provider = "gemini"
-
-        async def create_message(self, **kwargs):
-            self.kwargs = kwargs
-            yield {"type": "text", "text": "Look up"}
-            yield {
-                "type": "tool_use",
-                "id": "new",
-                "name": "lookup",
-                "input": {"key": "a"},
-                "thought_signature": b"opaque\xff",
-            }
-            yield {"type": "usage", "input_tokens": 3}
-
-    handler = Handler()
-    adapter = LegacyProvider(handler)
-    response = asyncio.run(adapter.complete(ModelRequest(messages=(Message(role="user", content="Task"),), turn=1)))
-    asyncio.run(
-        adapter.complete(
-            ModelRequest(
-                messages=(
-                    Message(role="system", content="System"),
-                    Message(role="assistant", tool_calls=response.tool_calls + (ToolCall(id="other", name="lookup"),)),
-                    Message(role="tool", tool_call_id="new", content="a"),
-                    Message(role="tool", tool_call_id="other", content="b", is_error=True),
-                ),
-                turn=2,
-            )
-        )
-    )
-    assert handler.kwargs["system_prompt"] == "System"
-    messages = handler.kwargs["messages"]
-    assert messages[0]["content"][0]["thought_signature"] == b"opaque\xff"
-    assert len(messages[1]["content"]) == 2
-    assert messages[1]["content"][1]["is_error"] is True
-    assert response.usage == {"input_tokens": 3}
-
-
-def test_legacy_tool_keeps_injection_and_converts_result():
-    def original(key: str, context: dict):
-        return NS(result=context[key], error=None)
-
-    OldTool = type(
-        "OldTool",
-        (),
-        {
-            "_func": original,
-            "name": "lookup",
-            "tags": {"read"},
-            "_inject_params": ["context"],
-        },
-    )
-    migrated = migrate_tool(OldTool())
-    assert "context" not in migrated.spec.parameters["properties"]
-    result = asyncio.run(migrated.invoke({"key": "a"}, {"context": {"a": "found"}}))
-    assert result.result == "found" and result.error is None
-    rejected = asyncio.run(migrated.invoke({"key": "a", "context": {"a": "bad"}}, {"context": {"a": "good"}}))
-    assert rejected.error
 
 
 def test_direct_stream_yields_text_before_tool_assembly_and_can_be_closed():
