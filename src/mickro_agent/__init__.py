@@ -1,6 +1,6 @@
 """Small agent loops, explicit state, and typed tools."""
 
-from .agent import Agent
+from .agent import Agent, Replay, Worker
 from .agent_tools import AGENT_JOB_TOOLS, AgentJobs, agent_call_tool_factory, agent_tool
 from .context_ops import (
     CompactionProposal,
@@ -17,11 +17,36 @@ from .context_ops import (
     TokenCounter,
 )
 from .flow import END, Flow, Node, node
+from .journal import (
+    ConfigurationChanged,
+    DurableStore,
+    JournalEntry,
+    JournalError,
+    MemoryStore,
+    NonDeterminismError,
+    ReplayExhausted,
+    RunLeaseHeld,
+    RunOwnershipLost,
+    RunRecord,
+    SqliteStore,
+    VersionUnsupported,
+)
 from .loops import PlanThenAct, ReAct, ReActWithSummary, finish_step, model_step, react_flow, tools_step
 from .providers.base import ApiHandler
 from .runtime import Loop, Provider, Runtime
 from .session_log import SessionLogError
 from .sessions import FileSessionStore, MemorySessionStore, Session, SessionStore
+from .shared import (
+    Committed,
+    InvalidPatch,
+    LogEntry,
+    PatchConflict,
+    SharedState,
+    SharedWorld,
+    StaleRead,
+    ToolShared,
+    Versioned,
+)
 from .tools import Hidden, Tool, ToolResult, Tools, tool
 from .types import (
     ApiHandlerCreateMessageMetadata,
@@ -39,6 +64,29 @@ from .types import (
 from .viz import build_dot, build_mermaid, render_graph, to_png
 
 __all__ = [
+    "Versioned",
+    "ToolShared",
+    "StaleRead",
+    "SharedWorld",
+    "SharedState",
+    "PatchConflict",
+    "LogEntry",
+    "InvalidPatch",
+    "Committed",
+    "VersionUnsupported",
+    "ReplayExhausted",
+    "Replay",
+    "ConfigurationChanged",
+    "Worker",
+    "SqliteStore",
+    "RunRecord",
+    "RunOwnershipLost",
+    "RunLeaseHeld",
+    "NonDeterminismError",
+    "MemoryStore",
+    "JournalError",
+    "JournalEntry",
+    "DurableStore",
     "AGENT_JOB_TOOLS",
     "END",
     "Agent",

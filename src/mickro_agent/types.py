@@ -155,12 +155,17 @@ class Run:
     error: str | None = None
     log_path: Path | None = field(default=None, init=False)
     _event_sink: Callable[[Event], None] | None = field(default=None, init=False, repr=False)
+    # While a recovered run replays its journal, its events were already logged.
+    _suppress_sink: bool = field(default=False, init=False, repr=False)
+    _sequence: int = field(default=0, init=False, repr=False)
+    _log_sequence: int = field(default=0, init=False, repr=False)
 
     def emit(self, kind: str, **data: JsonValue) -> None:
-        event = Event(run_id=self.id, session_id=self.session_id, sequence=len(self.events), kind=kind, data=data)
+        event = Event(run_id=self.id, session_id=self.session_id, sequence=self._sequence, kind=kind, data=data)
+        self._sequence += 1
         snapshot = event.model_copy(deep=True)
         self.events.append(snapshot)
-        if self._event_sink is not None:
+        if self._event_sink is not None and not self._suppress_sink:
             try:
                 self._event_sink(snapshot)
             except SessionLogError:
