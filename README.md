@@ -590,6 +590,56 @@ the caller. Session IDs identify conversations, not authentication credentials.
 `examples/live_chat.py` saves checkpoints in `artifacts/sessions` by default, accepts
 `--session-dir` and `--session-id`, and prints a concrete continuation command.
 
+## Durable runs and crash recovery
+
+Pass a `DurableStore` to make runs survive a crash of the process. Every model call
+and tool call is journaled at the `Runtime` boundary. Recovery re-runs the loop and
+returns recorded results instead of calling the provider or the tools again.
+
+```python
+from mickro_agent import Agent, Hidden, SqliteStore, Worker, tool
+
+store = SqliteStore("artifacts/durable.db")  # WAL, one file, one process
+
+
+@tool(effect="read")
+def lookup(key: str) -> str: ...
+
+
+@tool(effect="idempotent")
+def upsert(key: str, idempotency_key: Hidden[str]) -> str: ...  # stable across recovery
+
+
+@tool  # effect="unsafe" is the default
+def send_email(to: str, body: str) -> str: ...
+
+
+agent = Agent(provider=provider, tools=lookup | upsert | send_email, name="worker", store=store)
+run = await agent.run("Do the task", session_id="task-42")
+
+# After a crash, in a new process:
+runs = await Worker(store, [agent]).recover_all(force=True)  # or: await agent.recover("task-42")
+```
+
+A tool call that started before the crash but has no recorded result is handled by
+its `effect`:
+
+- `read`: executed again.
+- `idempotent`: executed again with the same `idempotency_key`.
+- `unsafe`: not executed again. It gets an "Outcome unknown" error result.
+
+Model calls with a recorded response are never repeated.
+
+Each run has an owner and an epoch. A process that lost ownership stops at its next
+journal write. A recovered run whose code issues different commands than the journal
+recorded raises `NonDeterminismError`, and the run stays recoverable. Loop and node
+code must therefore be deterministic; nondeterminism belongs in tools.
+
+The timeout budget counts active time only, not downtime between a crash and recovery.
+With a store, session checkpoints live in the same file and are committed together
+with each run's outcome. `MemoryStore` offers the same behaviour in memory, for tests.
+See [docs/durable-state.md](docs/durable-state.md) for the design and later phases.
+
 ## Session logging
 
 Logging is opt-in. Choose a directory on the agent, or override it for an individual

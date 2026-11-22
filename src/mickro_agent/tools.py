@@ -7,7 +7,7 @@ import inspect
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Annotated, Any, TypeVar, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, Literal, TypeVar, get_args, get_origin, get_type_hints
 
 from pydantic import ConfigDict, TypeAdapter, ValidationError, create_model
 
@@ -18,6 +18,11 @@ T = TypeVar("T")
 _INJECTED = object()
 Hidden = Annotated[T, _INJECTED]
 _JSON = TypeAdapter(Any)
+# How recovery treats a call that was started but has no recorded result:
+# read and idempotent calls run again (idempotent ones with the same key);
+# unsafe calls are not repeated and get an "outcome unknown" error result.
+Effect = Literal["read", "idempotent", "unsafe"]
+EFFECTS = frozenset({"read", "idempotent", "unsafe"})
 
 
 @dataclass(frozen=True)
@@ -41,10 +46,14 @@ class Tool:
         name: str | None = None,
         tags: Iterable[str] = (),
         injected: Iterable[str] = (),
+        effect: Effect = "unsafe",
     ):
+        if effect not in EFFECTS:
+            raise ValueError(f"effect must be one of {sorted(EFFECTS)}")
         self.function = function
         self.name = name or function.__name__
         self.tags = frozenset(tags)
+        self.effect = effect
         self.signature = inspect.signature(function)
         hints = get_type_hints(function, include_extras=True)
         self.injected = set(injected)
@@ -105,11 +114,21 @@ class Tool:
         return Tools([self]) | other
 
 
-def tool(function: Callable[..., Any] | None = None, *, name: str | None = None, tags: Iterable[str] = ()):
-    """Use as @tool or @tool(tags=[...]); Hidden[T] parameters come from run context."""
+def tool(
+    function: Callable[..., Any] | None = None,
+    *,
+    name: str | None = None,
+    tags: Iterable[str] = (),
+    effect: Effect = "unsafe",
+):
+    """Use as @tool or @tool(tags=[...], effect=...); Hidden[T] parameters come from run context.
+
+    A Hidden ``idempotency_key: Hidden[str]`` parameter receives a key that is
+    stable across crash recovery, for passing to idempotent external APIs.
+    """
 
     def decorate(fn: Callable[..., Any]) -> Tool:
-        return Tool(fn, name=name, tags=tags)
+        return Tool(fn, name=name, tags=tags, effect=effect)
 
     return decorate(function) if function is not None else decorate
 
@@ -130,6 +149,11 @@ class Tools:
     def __or__(self, other: Tool | Tools) -> Tools:
         items = [other] if isinstance(other, Tool) else other._registry.values()
         return Tools([*self._registry.values(), *items])
+
+    def effect(self, name: str) -> Effect:
+        """Effect kind of a tool; an unknown tool performs nothing, so it is a read."""
+        item = self._registry.get(name)
+        return item.effect if item is not None else "read"
 
     def select(self, *tags: str) -> Tools:
         return Tools(item for item in self._registry.values() if set(tags) <= item.tags)

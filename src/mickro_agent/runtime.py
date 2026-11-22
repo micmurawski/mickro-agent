@@ -19,6 +19,7 @@ from .context_ops import (
     is_summary,
 )
 from .history import validate_conversation
+from .journal import INTERRUPTED_CONTENT, JournalEntry, RunJournal, command_key
 from .providers.base import Provider
 from .providers.streaming import collect_response
 from .session_log import SessionLogError
@@ -34,18 +35,47 @@ class LimitReached(Exception):
     pass
 
 
+def _model_key(request: ModelRequest) -> str:
+    # run_id is excluded so that a fork can match its parent's recorded prefix.
+    return command_key("model", request.model_dump(mode="json", exclude={"run_id"}))
+
+
+def _tool_key(call: ToolCall) -> str:
+    return command_key("tool", {"id": call.id, "name": call.name, "arguments": call.arguments})
+
+
 class Runtime:
-    def __init__(self, run: Run, provider: Provider, tools: Tools, limits: Limits):
+    def __init__(
+        self, run: Run, provider: Provider, tools: Tools, limits: Limits, *, journal: RunJournal | None = None
+    ):
         self.run = run
         self.provider = provider
         self.tools = tools
         self.limits = limits
+        self.journal = journal
+        self._seq = 0
+        # Replaying: upcoming commands were recorded before a crash and are not repeated.
+        self.replaying = journal is not None and journal.last_recorded_seq > 0
+        run._suppress_sink = self.replaying
         self._pending: tuple[ToolCall, ...] = ()
         self._busy: str | None = None
         self._model_inflight = False
         self._marker_owner = object()
         self._context_version = 0
         self._compaction_token: object | None = None
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _go_live(self) -> None:
+        """Leave replay before the first command that was not recorded."""
+        if not self.replaying:
+            return
+        self.replaying = False
+        self.run._suppress_sink = False
+        self.run._sequence = max(self.run._sequence, self.run._log_sequence)
+        self.run.emit("run_recovered", epoch=self.journal.epoch, recorded_commands=self.journal.last_recorded_seq)
 
     def _active(self) -> None:
         if self.run.status != "running":
@@ -118,12 +148,30 @@ class Runtime:
             turn=self.run.model_calls,
             purpose=purpose,
         )
+        seq = self._next_seq()
         request_provider = provider if provider is not None else self.provider
         model = getattr(request_provider, "model", None)
         self.run.emit(
             "model_request", request=request.model_dump(mode="json"), conversation=conversation,
             provider=type(request_provider).__name__, model=model if isinstance(model, str) else None,
         )
+        journal_key = scheduled = None
+        if self.journal is not None:
+            journal_key = _model_key(request)
+            scheduled, completed = self.journal.check(seq, "model", journal_key)
+            if completed is not None:
+                response = ModelResponse.model_validate(completed.payload["response"])
+                for name, value in response.usage.items():
+                    self.run.usage[name] = self.run.usage.get(name, 0) + value
+                self.run.emit(
+                    "model_response", response=response.model_dump(mode="json"),
+                    turn=request.turn, purpose=purpose, conversation=conversation,
+                )
+                return response
+            self._go_live()
+            if scheduled is None:
+                await self.journal.append(JournalEntry(seq=seq, phase="scheduled", kind="model", key=journal_key,
+                                                       payload={"purpose": purpose, "turn": request.turn}))
 
         def on_chunk(chunk: StreamChunk) -> None:
             # Usage already received remains charged if a later chunk fails or
@@ -144,6 +192,9 @@ class Runtime:
         ids = [call.id for call in response.tool_calls]
         if len(ids) != len(set(ids)):
             raise ValueError("Provider returned duplicate tool call IDs")
+        if self.journal is not None:
+            await self.journal.append(JournalEntry(seq=seq, phase="completed", kind="model", key=journal_key,
+                                                   payload={"response": response.model_dump(mode="json")}))
         self.run.emit(
             "model_response", response=response.model_dump(mode="json"),
             turn=request.turn, purpose=purpose, conversation=conversation,
@@ -168,28 +219,73 @@ class Runtime:
         if self.run.tool_calls + len(calls) > self.limits.max_tool_calls:
             raise LimitReached("Tool call limit reached; batch was not executed")
         self.run.tool_calls += len(calls)
+        # Sequence numbers follow the provider's order, never completion order.
+        seqs = [self._next_seq() for _ in calls]
+        keys = [_tool_key(call) for call in calls]
+        known: dict[int, Message] = {}
+        if self.journal is not None:
+            new_rows, interrupted = [], []
+            for index, (call, seq, key) in enumerate(zip(calls, seqs, keys, strict=True)):
+                scheduled, completed = self.journal.check(seq, "tool", key)
+                if completed is not None:
+                    known[index] = Message.model_validate(completed.payload["message"])
+                elif scheduled is None:
+                    new_rows.append(JournalEntry(seq=seq, phase="scheduled", kind="tool", key=key,
+                                                 payload={"call_id": call.id, "name": call.name,
+                                                          "effect": self.tools.effect(call.name)}))
+                elif self.tools.effect(call.name) == "unsafe":
+                    # Started before a crash with no recorded result: do not repeat the effect.
+                    interrupted.append(index)
+            for index, message in sorted(known.items()):
+                self.run.emit("tool_start", call=calls[index].model_dump(mode="json"))
+                self.run.emit("tool_result", message=message.model_dump(mode="json"))
+            if len(known) < len(calls):
+                self._go_live()
+            if new_rows:
+                await self.journal.append(*new_rows)
+            for index in interrupted:
+                message = Message(role="tool", tool_call_id=calls[index].id, is_error=True, content=INTERRUPTED_CONTENT)
+                await self.journal.append(JournalEntry(seq=seqs[index], phase="completed", kind="tool",
+                                                       key=keys[index],
+                                                       payload={"message": message.model_dump(mode="json"),
+                                                                "synthetic": True}))
+                self.run.emit("tool_result", message=message.model_dump(mode="json"), synthetic=True)
+                known[index] = message
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def execute(call: ToolCall) -> Message:
+        async def execute(index: int) -> Message:
+            call, seq = calls[index], seqs[index]
             async with semaphore:
                 self.run.emit("tool_start", call=call.model_dump(mode="json"))
+                context = {
+                    **self.run.context,
+                    "runtime": self,
+                    "idempotency_key": f"{self.run.session_id}:{self.run.id}:{seq}:{call.id}",
+                }
                 # A timed-out effect has an unknown outcome: stop the run, do not retry it.
                 async with asyncio.timeout(self.limits.tool_timeout):
-                    result = await self.tools.invoke(call, {**self.run.context, "runtime": self})
+                    result = await self.tools.invoke(call, context)
                 message = Message(
                     role="tool", tool_call_id=call.id, content=result.content(), is_error=result.error is not None
                 )
+                if self.journal is not None:
+                    await self.journal.append(JournalEntry(seq=seq, phase="completed", kind="tool", key=keys[index],
+                                                           payload={"message": message.model_dump(mode="json")}))
                 self.run.emit("tool_result", message=message.model_dump(mode="json"))
                 return message
 
         if concurrency == 1:
-            for call in calls:
-                self.run.messages.append(await execute(call))
+            for index in range(len(calls)):
+                self.run.messages.append(known[index] if index in known else await execute(index))
         else:
             # TaskGroup cancels siblings on failure; results retain the provider's order.
             async with asyncio.TaskGroup() as group:
-                tasks = [group.create_task(execute(call)) for call in calls]
-            self.run.messages.extend(task.result() for task in tasks)
+                tasks = {
+                    index: group.create_task(execute(index)) for index in range(len(calls)) if index not in known
+                }
+            self.run.messages.extend(
+                known[index] if index in known else tasks[index].result() for index in range(len(calls))
+            )
         self._pending = ()
 
     def finish(self, output: str) -> None:
