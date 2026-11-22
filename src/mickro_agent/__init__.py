@@ -36,6 +36,17 @@ from .providers.base import ApiHandler
 from .runtime import Loop, Provider, Runtime
 from .session_log import SessionLogError
 from .sessions import FileSessionStore, MemorySessionStore, Session, SessionStore
+from .shared import (
+    Committed,
+    InvalidPatch,
+    LogEntry,
+    PatchConflict,
+    SharedState,
+    SharedWorld,
+    StaleRead,
+    ToolShared,
+    Versioned,
+)
 from .tools import Hidden, Tool, ToolResult, Tools, tool
 from .types import (
     ApiHandlerCreateMessageMetadata,
@@ -53,6 +64,15 @@ from .types import (
 from .viz import build_dot, build_mermaid, render_graph, to_png
 
 __all__ = [
+    "Versioned",
+    "ToolShared",
+    "StaleRead",
+    "SharedWorld",
+    "SharedState",
+    "PatchConflict",
+    "LogEntry",
+    "InvalidPatch",
+    "Committed",
     "VersionUnsupported",
     "ReplayExhausted",
     "Replay",

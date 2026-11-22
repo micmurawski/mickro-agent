@@ -1,8 +1,9 @@
 # Durable agent state
 
-Status: phases 1–2 (journal, recovery, determinism, replay and forks) are implemented
-in [journal.py](../src/mickro_agent/journal.py), [runtime.py](../src/mickro_agent/runtime.py)
-and [agent.py](../src/mickro_agent/agent.py); the rest is design. Scope: the Python
+Status: phases 1–3 (journal, recovery, determinism, replay, forks and the shared tree)
+are implemented in [journal.py](../src/mickro_agent/journal.py),
+[runtime.py](../src/mickro_agent/runtime.py), [agent.py](../src/mickro_agent/agent.py)
+and [shared.py](../src/mickro_agent/shared.py); the rest is design. Scope: the Python
 package (`src/mickro_agent`).
 The Rust crate follows later against the same storage schema.
 
@@ -122,15 +123,22 @@ transaction**, so the checkpoint can never lag behind the run.
 | `tool_completed` | tool `Message`, `synthetic: bool` | after invoking |
 | `side_effect` | `kind` (`now`, `uuid`, `random`), value | on first execution |
 | `version_marker` | `change_id`, version | on first execution |
-| `shared_read` | path, canonical path, value, version, ref-slot versions, offset | each `runtime.shared.get` |
-| `shared_scheduled` / `shared_completed` | `op_id`, ops, result (committed offset or rejection) | each shared write, lock or ref op |
+| `shared_read` (completed) | path, value, version, offset (ref-slot versions in phase 6) | each `runtime.shared.get` |
+| `shared_write` (completed) | result: committed offset, or rejection | each shared write, in the **same transaction** as its log entry |
 | `timer_started` / `timer_fired` | `fire_at` | `runtime.sleep` |
 | `signal_received` | inbox id, name, payload | `runtime.wait_signal` |
 | `child_started` / `child_completed` | child `session_id` and `run_id`, result | delegation |
 | `compaction_applied` | range, replacement messages | on success (the summary itself is a `model_*` pair) |
 
-Implemented in phase 1: `model_*` and `tool_*`. Compaction needs no entry of its own,
+Implemented: `model_*` and `tool_*` (phase 1); `side_effect` and `version` (phase 2);
+`shared_read` and `shared_write` (phase 3). Compaction needs no entry of its own,
 because the summary is a journaled model call and applying it is deterministic.
+
+A shared write has no `scheduled` row. Its `op_id` is `session:run:seq`, which is
+deterministic, so a crash before the commit simply commits it on recovery, and a crash
+after it is deduplicated. The `completed` row is written atomically with the log
+entry. It is also written for a **rejection**, which therefore replays as the same
+`StaleRead` or `PatchConflict`.
 
 `request_hash` is `sha256` of canonical JSON over `messages`, `tools` and `purpose`.
 `run_id` is excluded so that a fork can match its parent's prefix.
@@ -172,10 +180,11 @@ def charge(amount: int, idempotency_key: Hidden[str]) -> str: ...
 `idempotency_key = f"{session_id}:{run_id}:{seq}:{call_id}"`. It is injected like any
 `Hidden` value and is stable across crashes and replays.
 
-**Shared ops inside a tool** are not journaled separately, because the tool's result
-is. Their `op_id` is `f"{idempotency_key}:{n}"`, where `n` is a counter for that call.
-Re-executing an idempotent tool therefore deduplicates its writes, as long as the tool
-issues them in the same order.
+**Shared ops inside a tool** go through `shared: Hidden[ToolShared]`. They are not
+journaled separately, because the tool's result is. Their `op_id` is
+`f"{idempotency_key}:{n}"`, where `n` is a counter for that call. Re-executing an
+idempotent tool therefore deduplicates its writes, as long as the tool issues them in
+the same order.
 
 ### 4.4 Run ownership
 
@@ -287,7 +296,9 @@ startup.
   stops before it.
 - A replayed failure, such as a limit or an error raised by a node, becomes part of
   the inspected state.
-- The shared-state view at the offsets the run had read comes with phase 3.
+- Shared reads return what the run read, not today's value. Each recorded read
+  carries the world `offset` it saw, and `world.at(offset)` rebuilds the whole world as
+  of that moment.
 
 **Fork.** Call it on an agent with the configuration to try, e.g.
 `replace(agent, provider=other, system_prompt=...)`.
@@ -336,15 +347,43 @@ Each node has two version numbers, both log offsets:
 - `subtree_version`: the last write at or below this path. Each write bumps the
   written path and all its ancestors.
 
-`get` returns `Versioned(value, version=subtree_version, offset=head)`. A read of `p`
-at version `v` is **stale** at a later head if either:
+`get` returns `Versioned(path, value, version, offset, exists)`, where `version` is the
+larger of `subtree_version(p)` and every ancestor's `own_version`: the offset of the
+last write that affected `p`. A `based_on` read is **stale** when that number has
+changed. A write is never undone, so a change is always an increase in practice.
 
-- `subtree_version(p) > v`, or
-- some ancestor `a` of `p` has `own_version(a) > v`, because replacing a parent
-  replaces `p`.
+The rules, each with a test:
+
+| Write after reading `p` | Stale? |
+|---|---|
+| a sibling of `p` | no |
+| `p` itself, or anything below it | yes |
+| an ancestor of `p` (replace or remove) | yes |
+| creating `p`, directly or by adding an ancestor, after reading it as missing | yes |
+| anything inside an array that contains `p` | yes: **an array is versioned as one unit**, because inserting shifts every later index |
+| a `test` op | no: `test` writes nothing |
+
+A replaced or removed path's version node is kept, not pruned. Otherwise its version
+would fall back to an older ancestor's and could equal an old read.
 
 Every `runtime.shared.get` is journaled as `shared_read`, so replay returns what the
 agent actually saw.
+
+**Patch semantics (implemented):**
+
+- RFC 6902 `add`, `remove`, `replace` and `test`, including array insert and `-`
+  (append).
+- A patch is atomic: if any op fails, nothing changes, and no offset is used.
+- `test` uses JSON equality, so `1` is not `true` and key order doesn't matter.
+- A malformed patch raises `InvalidPatch` before anything is journaled: an unknown op,
+  a missing value, a non-JSON value, more than 100 ops, or more than 256 KB.
+- A missing path or a failed `test` raises `PatchConflict`; a changed `based_on` read
+  raises `StaleRead`. Both are rejections, which are journaled.
+- `world.patch(ops, op_id=...)` makes a write outside a run idempotent.
+
+States are immutable. Each write copies only the containers along its path, so a
+rejected patch changes nothing, readers never see half a batch, and time travel
+rebuilds a world cheaply.
 
 **Optimistic writes.** These are opt-in per write:
 
@@ -460,6 +499,20 @@ and `wrap` count toward the commit size limit (section 11.1).
 
 ### 6.5 API
 
+Implemented in phase 3:
+
+```python
+world = SharedWorld(store, name="default", snapshot_every=1000)
+agent = Agent(..., store=store, shared=world)    # the world must live in the agent's store
+
+v = await runtime.shared.get("/plan")            # journaled read
+await runtime.shared.patch(ops, based_on=[v])    # journaled write; StaleRead / PatchConflict
+world.read(path); world.at(offset); world.log(after=0); world.refresh()
+await world.patch(ops, based_on=..., op_id=...)  # outside a run, e.g. a supervisor
+```
+
+Planned (phases 4–7):
+
 ```python
 world = SharedWorld(backend, name="default")
 agent = Agent(..., shared=world, shared_policy=Policy(read=["/"], write=["/e", "/agents/researcher"]))
@@ -512,6 +565,22 @@ all writes. Agents put journal entries and shared ops on its queue and await a f
   against a second process opening the file.
 - At a few hundred agents, this keeps write load to a few transactions per second,
   however many agents there are.
+
+**As implemented (phase 3):**
+
+- A shared commit is an operation in the same committer as journal writes. It is
+  applied inside the write batch:
+  1. check the run's epoch, so **a stale owner cannot write shared state**;
+  2. catch the cached state up to `head` from the log, in case another process wrote;
+  3. deduplicate by `op_id`;
+  4. validate `based_on` and apply the patch;
+  5. insert the log entry and update `head`, plus a snapshot every `snapshot_every`
+     entries;
+  6. insert the run's `shared_write` row;
+  7. stage the new state.
+- Staged states become visible to readers only after the transaction commits.
+- Validation runs in commit order against staged states, so 50 concurrent
+  compare-and-swap writers are serialized correctly and lose no update.
 
 ## 8. Signals, timers, waits and children
 
@@ -797,18 +866,8 @@ CREATE TABLE journal (
 );
 
 CREATE TABLE sessions (session_id TEXT PRIMARY KEY, body TEXT NOT NULL);
-```
 
-Planned for later phases:
-
-```sql
-CREATE TABLE inbox (
-  session_id TEXT NOT NULL, id INTEGER NOT NULL,
-  name TEXT NOT NULL, payload TEXT NOT NULL, sent_at TEXT NOT NULL,
-  consumed_run TEXT, consumed_seq INTEGER,
-  PRIMARY KEY (session_id, id)
-);
-
+-- Phase 3 (PRAGMA user_version = 2; a version 1 file gains these tables when opened):
 CREATE TABLE shared_head (world TEXT PRIMARY KEY, head INTEGER NOT NULL);
 
 CREATE TABLE shared_log (
@@ -819,8 +878,19 @@ CREATE TABLE shared_log (
 CREATE UNIQUE INDEX shared_log_op ON shared_log (world, op_id);
 
 CREATE TABLE shared_snapshots (
-  world TEXT NOT NULL, offset INTEGER NOT NULL, body BLOB NOT NULL,  -- tree + versions + locks + backrefs
+  world TEXT NOT NULL, offset INTEGER NOT NULL, body TEXT NOT NULL,  -- JSON: tree + versions (+ locks, backrefs)
   PRIMARY KEY (world, offset)
+);
+```
+
+Planned for later phases:
+
+```sql
+CREATE TABLE inbox (
+  session_id TEXT NOT NULL, id INTEGER NOT NULL,
+  name TEXT NOT NULL, payload TEXT NOT NULL, sent_at TEXT NOT NULL,
+  consumed_run TEXT, consumed_seq INTEGER,
+  PRIMARY KEY (session_id, id)
 );
 ```
 
@@ -883,11 +953,23 @@ replays are deterministic. Phases 1–2 are the durable-run core and come first.
      - replay at every step performs no write and no effect;
      - a fork with a different provider and system prompt reuses its prefix, diverges
        after it, and can itself be recovered.
-3. **Shared tree core**
-   - Work: `SharedBackend` (memory and SQLite), log, snapshots, JSON Pointer and Patch,
-     versions, journaled reads, `based_on`, provenance, the conformance suite.
-   - Tests: time travel equals the replayed state at every offset, staleness rules,
-     deduplication, and validation order within a group commit.
+3. **Shared tree core** (done)
+   - Work: shared tables in both stores (instead of a separate `SharedBackend`, so a
+     write and its journal row commit together), log, snapshots, JSON Pointer and
+     Patch, versions, journaled reads and writes, `based_on`, provenance (`based_on`
+     and author in every log entry), `ToolShared` for tools, the conformance suite.
+   - Tests:
+     - the conformance suite on memory and SQLite: patch semantics, atomic rejection,
+       the staleness table, deduplication, time travel and restart at every offset
+       with snapshots, 50 concurrent compare-and-swap writers;
+     - a crash at every write gives exactly one increment;
+     - a journaled rejection replays;
+     - replay returns what the run read;
+     - a stale owner cannot write;
+     - an idempotent tool's re-execution writes once.
+   - Note: a fork writes to the same world as its source, because the world is
+     global. Give the forking agent a scratch world to keep experiments out of it:
+     `replace(agent, shared=SharedWorld(store, "sandbox"))`.
 4. **Locks**
    - Work: mandatory exclusive locks tied to run leases, fences, `lock_many`,
      `try_lock`, reducer paths, `SHARED_TOOLS` (minus refs).

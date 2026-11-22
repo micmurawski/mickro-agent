@@ -26,6 +26,7 @@ from .loops import ReAct
 from .runtime import LimitReached, Loop, Provider, Runtime
 from .session_log import SessionLog, SessionLogError, validate_session_id
 from .sessions import MemorySessionStore, Session, SessionStore
+from .shared import SharedWorld
 from .tools import Tools
 from .types import Limits, Message, Run, ToolCall
 
@@ -146,12 +147,16 @@ class Agent:
     sessions: SessionStore | None = field(default=None, repr=False, compare=False)
     store: DurableStore | None = field(default=None, repr=False, compare=False)
     lease_ttl: float = 30.0
+    shared: SharedWorld | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.sessions is None:
             object.__setattr__(self, "sessions", self.store if self.store is not None else MemorySessionStore())
         if not self.lease_ttl > 0:
             raise ValueError("lease_ttl must be positive")
+        if self.shared is not None and self.store is not None and self.shared.store is not self.store:
+            # One store: a shared write and the run's journal row must commit together.
+            raise ValueError("Agent.shared must be a world in the agent's own store")
 
     def get_flow_graph(self, *, direction: str = "LR") -> str:
         """Return Mermaid for a Flow or a loop exposing to_flow()."""
@@ -308,7 +313,7 @@ class Agent:
             None, session_id, run_id, record.epoch, self.store.journal(session_id, run_id),
             readonly=True, until_seq=until_seq, lenient_until=_lenient_until(record.start),
         )
-        runtime = Runtime(run, self.provider, self.tools, self.limits, journal=journal)
+        runtime = Runtime(run, self.provider, self.tools, self.limits, journal=journal, shared=self.shared)
         reason = "finished"
         try:
             await self.loop.run(runtime)
@@ -494,7 +499,7 @@ class Agent:
                     # Without a journal, a "running" checkpoint is how a crash is detected later.
                     await self._checkpoint(run, "running")
                 runtime = Runtime(
-                    run, self.provider, self.tools, self.limits, journal=journal,
+                    run, self.provider, self.tools, self.limits, journal=journal, shared=self.shared,
                     **({"log_replay": recovery.log_replay, "live_event": recovery.live_event} if recovery else {}),
                 )
                 model = getattr(self.provider, "model", None)

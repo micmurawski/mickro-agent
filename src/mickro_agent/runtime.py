@@ -33,6 +33,7 @@ from .journal import (
 from .providers.base import Provider
 from .providers.streaming import collect_response
 from .session_log import SessionLogError
+from .shared import SharedView, SharedWorld, ToolShared
 from .tools import Tools
 from .types import Limits, Message, ModelRequest, ModelResponse, Run, StreamChunk, ToolCall
 
@@ -65,6 +66,7 @@ class Runtime:
         journal: RunJournal | None = None,
         log_replay: bool = False,
         live_event: tuple[str, dict] = ("run_recovered", {}),
+        shared: SharedWorld | None = None,
     ):
         self.run = run
         self.provider = provider
@@ -78,12 +80,23 @@ class Runtime:
         # A recovered run's replayed events are already in its log; a fork's are not.
         run._suppress_sink = self.replaying and not log_replay
         self._live_event = live_event
+        self._world = shared
+        self._shared_view: SharedView | None = None
         self._pending: tuple[ToolCall, ...] = ()
         self._busy: str | None = None
         self._model_inflight = False
         self._marker_owner = object()
         self._context_version = 0
         self._compaction_token: object | None = None
+
+    @property
+    def shared(self) -> SharedView:
+        """The agent's shared world; reads and writes are journaled commands of this run."""
+        if self._world is None:
+            raise RuntimeError("This agent has no shared world; pass Agent(shared=SharedWorld(store))")
+        if self._shared_view is None:
+            self._shared_view = SharedView(self, self._world)
+        return self._shared_view
 
     def _next_seq(self) -> int:
         self._seq += 1
@@ -349,11 +362,12 @@ class Runtime:
             call, seq = calls[index], seqs[index]
             async with semaphore:
                 self.run.emit("tool_start", call=call.model_dump(mode="json"))
-                context = {
-                    **self.run.context,
-                    "runtime": self,
-                    "idempotency_key": f"{self.run.session_id}:{self.run.id}:{seq}:{call.id}",
-                }
+                idempotency_key = f"{self.run.session_id}:{self.run.id}:{seq}:{call.id}"
+                context = {**self.run.context, "runtime": self, "idempotency_key": idempotency_key}
+                if self._world is not None:
+                    context["shared"] = ToolShared(self._world, idempotency_key, {
+                        "session": self.run.session_id, "run": self.run.id, "seq": seq, "call_id": call.id,
+                    })
                 # A timed-out effect has an unknown outcome: stop the run, do not retry it.
                 async with asyncio.timeout(self.limits.tool_timeout):
                     result = await self.tools.invoke(call, context)

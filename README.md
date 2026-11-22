@@ -658,6 +658,25 @@ fork = await other.fork(session_id, run_id, at_seq=3)  # reuse 3 commands, then 
 Recovery under a changed configuration (loop, flow, tools, provider or model) raises
 `ConfigurationChanged`, naming the parts; `allow_fingerprint_change=True` proceeds.
 
+Agents can share one JSON tree, a `SharedWorld`, kept in the same store. Paths are JSON
+Pointers, and writes are JSON Patch operations committed to an append-only log:
+
+```python
+world = SharedWorld(store)
+agent = Agent(..., store=store, shared=world)
+
+# in loop code:
+plan = await runtime.shared.get("/plan")                      # value + version
+await runtime.shared.patch([{"op": "replace", "path": "/plan/status", "value": "done"}],
+                           based_on=[plan])                    # StaleRead if /plan changed since
+
+world.at(offset)        # the whole world as of any earlier offset
+```
+
+Shared reads and writes are journaled, so recovery and replay see what the run saw.
+Each write commits once, in the same transaction as its journal row, and a stale owner
+can't write. Tools get a deduplicating handle through `shared: Hidden[ToolShared]`.
+
 The timeout budget counts active time only, not downtime between a crash and recovery.
 With a store, session checkpoints live in the same file and are committed together
 with each run's outcome. `MemoryStore` offers the same behaviour in memory, for tests.

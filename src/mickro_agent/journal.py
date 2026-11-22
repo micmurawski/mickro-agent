@@ -28,7 +28,7 @@ from .session_log import validate_session_id
 from .sessions import Session
 from .types import Record
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2 adds the shared-state tables; a version 1 file is upgraded in place.
 INTERRUPTED_CONTENT = "Execution interrupted. Outcome unknown; inspect external state before retrying."
 
 
@@ -87,7 +87,7 @@ class JournalEntry(Record):
     seq: int = Field(ge=1)
     # A marker (a version() decision) is found by its key, not by its position.
     phase: Literal["scheduled", "completed", "marker"]
-    kind: Literal["model", "tool", "side_effect", "version"]
+    kind: Literal["model", "tool", "side_effect", "version", "shared_read", "shared_write"]
     key: str
     payload: dict[str, JsonValue] = Field(default_factory=dict)
 
@@ -223,6 +223,13 @@ class _Tx:
     def put_run(self, record: RunRecord) -> None: ...
     def insert_entries(self, session_id: str, run_id: str, epoch: int, entries: Sequence[JournalEntry]) -> None: ...
     def put_session(self, session: Session) -> None: ...
+    # Shared worlds (see shared.py).
+    def get_head(self, world: str) -> int: ...
+    def set_head(self, world: str, head: int) -> None: ...
+    def insert_log(self, world: str, entry) -> None: ...
+    def find_op(self, world: str, op_id: str): ...
+    def read_log(self, world: str, after: int) -> list: ...
+    def put_snapshot(self, world: str, offset: int, body: dict) -> None: ...
 
 
 def _owned(tx: _Tx, session_id: str, run_id: str, epoch: int) -> RunRecord:
@@ -288,6 +295,9 @@ def _apply(tx: _Tx, op: Any) -> Any:
     if isinstance(op, _SaveSession):
         tx.put_session(op.session)
         return None
+    apply_in = getattr(op, "apply_in", None)
+    if apply_in is not None:  # Operations defined by other modules, e.g. shared-state commits.
+        return apply_in(tx)
     raise TypeError(f"Unknown journal operation {type(op).__name__}")
 
 
@@ -302,6 +312,17 @@ class DurableStore:
         self.owner_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
         self._committer = _Committer(self._write_batch, threaded=threaded)
         self._locks: dict[str, asyncio.Lock] = {}
+        self._worlds: dict[str, Any] = {}  # Open SharedWorlds by name.
+        self._staged: dict[str, Any] = {}  # World states written in the current batch, not yet committed.
+
+    def _publish(self) -> None:
+        """After a successful commit: make staged world states visible to readers."""
+        staged, self._staged = self._staged, {}
+        for name, state in staged.items():
+            self._worlds[name]._publish(state)
+
+    def _discard(self) -> None:
+        self._staged = {}
 
     # Backend hooks --------------------------------------------------------
     def _write_batch(self, ops: list) -> list:
@@ -318,6 +339,15 @@ class DurableStore:
         raise NotImplementedError
 
     def load(self, session_id: str) -> Session | None:
+        raise NotImplementedError
+
+    def _shared_head(self, world: str) -> int:
+        raise NotImplementedError
+
+    def _shared_log(self, world: str, after: int, until: int | None) -> list:
+        raise NotImplementedError
+
+    def _shared_snapshot(self, world: str, at_or_before: int | None) -> dict | None:
         raise NotImplementedError
 
     # SessionStore ---------------------------------------------------------
@@ -378,6 +408,10 @@ class MemoryStoreData:
     runs: dict[tuple[str, str], RunRecord] = field(default_factory=dict)
     entries: dict[tuple[str, str], dict[tuple[int, str], JournalEntry]] = field(default_factory=dict)
     sessions: dict[str, Session] = field(default_factory=dict)
+    heads: dict[str, int] = field(default_factory=dict)
+    logs: dict[str, list] = field(default_factory=dict)  # world -> entries, offset i at index i - 1
+    op_ids: dict[tuple[str, str], int] = field(default_factory=dict)
+    snapshots: dict[str, dict[int, dict]] = field(default_factory=dict)
 
 
 class _MemoryTx(_Tx):
@@ -388,6 +422,9 @@ class _MemoryTx(_Tx):
         self.runs: dict[tuple[str, str], RunRecord] = {}
         self.entries: list[tuple[tuple[str, str], JournalEntry]] = []
         self.sessions: dict[str, Session] = {}
+        self.heads: dict[str, int] = {}
+        self.logs: list[tuple[str, Any]] = []
+        self.snapshots: list[tuple[str, int, dict]] = []
 
     def get_run(self, session_id, run_id):
         key = (session_id, run_id)
@@ -409,11 +446,38 @@ class _MemoryTx(_Tx):
     def put_session(self, session):
         self.sessions[session.session_id] = session
 
+    def get_head(self, world):
+        return self.heads.get(world, self.data.heads.get(world, 0))
+
+    def set_head(self, world, head):
+        self.heads[world] = head
+
+    def insert_log(self, world, entry):
+        if (world, entry.op_id) in self.data.op_ids or len(self.data.logs.get(world, ())) >= entry.offset:
+            raise JournalError(f"Shared log entry {entry.offset} or op {entry.op_id} already exists")
+        self.logs.append((world, entry))
+
+    def find_op(self, world, op_id):
+        offset = self.data.op_ids.get((world, op_id))
+        return self.data.logs[world][offset - 1] if offset is not None else None
+
+    def read_log(self, world, after):
+        return list(self.data.logs.get(world, [])[after:])
+
+    def put_snapshot(self, world, offset, body):
+        self.snapshots.append((world, offset, body))
+
     def commit(self) -> None:
         self.data.runs.update(self.runs)
         for key, entry in self.entries:
             self.data.entries.setdefault(key, {})[entry.seq, entry.phase] = entry
         self.data.sessions.update(self.sessions)
+        for world, entry in self.logs:
+            self.data.logs.setdefault(world, []).append(entry)
+            self.data.op_ids[world, entry.op_id] = entry.offset
+        self.data.heads.update(self.heads)
+        for world, offset, body in self.snapshots:
+            self.data.snapshots.setdefault(world, {})[offset] = json.loads(json.dumps(body))
 
 
 class MemoryStore(DurableStore):
@@ -430,7 +494,9 @@ class MemoryStore(DurableStore):
             try:
                 results.append(_apply(tx, op))
                 tx.commit()
+                self._publish()
             except Exception as exc:  # noqa: BLE001 - Returned to the op's submitter.
+                self._discard()
                 results.append(exc)
         return results
 
@@ -453,6 +519,17 @@ class MemoryStore(DurableStore):
         validate_session_id(session_id)
         session = self.data.sessions.get(session_id)
         return session.model_copy(deep=True) if session is not None else None
+
+    def _shared_head(self, world):
+        return self.data.heads.get(world, 0)
+
+    def _shared_log(self, world, after, until):
+        return list(self.data.logs.get(world, [])[after:until])
+
+    def _shared_snapshot(self, world, at_or_before):
+        snapshots = self.data.snapshots.get(world, {})
+        offsets = [offset for offset in snapshots if at_or_before is None or offset <= at_or_before]
+        return json.loads(json.dumps(snapshots[max(offsets)])) if offsets else None
 
 
 # SQLite ------------------------------------------------------------------
@@ -487,6 +564,24 @@ CREATE TABLE IF NOT EXISTS journal (
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
   body TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shared_head (
+  world TEXT PRIMARY KEY,
+  head INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shared_log (
+  world TEXT NOT NULL,
+  offset INTEGER NOT NULL,
+  op_id TEXT NOT NULL,
+  entry TEXT NOT NULL,
+  PRIMARY KEY (world, offset)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS shared_log_op ON shared_log (world, op_id);
+CREATE TABLE IF NOT EXISTS shared_snapshots (
+  world TEXT NOT NULL,
+  offset INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  PRIMARY KEY (world, offset)
 );
 """
 
@@ -568,6 +663,44 @@ class _SqliteTx(_Tx):
             (session.session_id, session.model_dump_json()),
         )
 
+    def get_head(self, world):
+        row = self.connection.execute("SELECT head FROM shared_head WHERE world = ?", (world,)).fetchone()
+        return row[0] if row else 0
+
+    def set_head(self, world, head):
+        self.connection.execute("INSERT OR REPLACE INTO shared_head (world, head) VALUES (?, ?)", (world, head))
+
+    def insert_log(self, world, entry):
+        try:
+            self.connection.execute(
+                "INSERT INTO shared_log (world, offset, op_id, entry) VALUES (?, ?, ?, ?)",
+                (world, entry.offset, entry.op_id, entry.model_dump_json()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise JournalError(f"Shared log entry {entry.offset} or op {entry.op_id} already exists") from exc
+
+    def find_op(self, world, op_id):
+        from .shared import LogEntry
+
+        row = self.connection.execute(
+            "SELECT entry FROM shared_log WHERE world = ? AND op_id = ?", (world, op_id)
+        ).fetchone()
+        return LogEntry.model_validate_json(row[0]) if row else None
+
+    def read_log(self, world, after):
+        from .shared import LogEntry
+
+        rows = self.connection.execute(
+            "SELECT entry FROM shared_log WHERE world = ? AND offset > ? ORDER BY offset", (world, after)
+        ).fetchall()
+        return [LogEntry.model_validate_json(row[0]) for row in rows]
+
+    def put_snapshot(self, world, offset, body):
+        self.connection.execute(
+            "INSERT OR REPLACE INTO shared_snapshots (world, offset, body) VALUES (?, ?, ?)",
+            (world, offset, json.dumps(body, ensure_ascii=False)),
+        )
+
 
 class SqliteStore(DurableStore):
     """Single-file durable store (WAL, synchronous=FULL) for one process on one host.
@@ -587,7 +720,7 @@ class SqliteStore(DurableStore):
             self._connection.execute("PRAGMA synchronous=FULL")
             self._connection.execute("PRAGMA busy_timeout=5000")
             version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, SCHEMA_VERSION):
+            if version not in (0, 1, SCHEMA_VERSION):
                 raise JournalError(f"Unsupported journal schema version {version} in {self.path}")
             self._connection.executescript(_SCHEMA)
             self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -614,9 +747,14 @@ class SqliteStore(DurableStore):
                         results.append(exc)
                 connection.execute("COMMIT")
             except sqlite3.Error as exc:
+                self._discard()
                 if connection.in_transaction:
                     connection.execute("ROLLBACK")
                 raise JournalError(f"Cannot write journal {self.path}: {exc}") from exc
+            except BaseException:
+                self._discard()
+                raise
+            self._publish()
             return results
 
     def _read(self, sql: str, parameters: tuple = ()) -> list:
@@ -650,6 +788,26 @@ class SqliteStore(DurableStore):
             JournalEntry(seq=seq, phase=phase, kind=kind, key=key, payload=json.loads(payload))
             for seq, phase, kind, key, payload in rows
         ]
+
+    def _shared_head(self, world):
+        rows = self._read("SELECT head FROM shared_head WHERE world = ?", (world,))
+        return rows[0][0] if rows else 0
+
+    def _shared_log(self, world, after, until):
+        from .shared import LogEntry
+
+        rows = self._read(
+            "SELECT entry FROM shared_log WHERE world = ? AND offset > ? AND offset <= ? ORDER BY offset",
+            (world, after, until if until is not None else 2**62),
+        )
+        return [LogEntry.model_validate_json(row[0]) for row in rows]
+
+    def _shared_snapshot(self, world, at_or_before):
+        rows = self._read(
+            "SELECT body FROM shared_snapshots WHERE world = ? AND offset <= ? ORDER BY offset DESC LIMIT 1",
+            (world, at_or_before if at_or_before is not None else 2**62),
+        )
+        return json.loads(rows[0][0]) if rows else None
 
     def load(self, session_id):
         validate_session_id(session_id)
