@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Protocol
+import random as _random
+from datetime import UTC, datetime
+from typing import Any, Protocol
+from uuid import uuid4
 
 from .context_ops import (
     CompactionProposal,
@@ -19,7 +22,14 @@ from .context_ops import (
     is_summary,
 )
 from .history import validate_conversation
-from .journal import INTERRUPTED_CONTENT, JournalEntry, RunJournal, command_key
+from .journal import (
+    INTERRUPTED_CONTENT,
+    JournalEntry,
+    ReplayExhausted,
+    RunJournal,
+    VersionUnsupported,
+    command_key,
+)
 from .providers.base import Provider
 from .providers.streaming import collect_response
 from .session_log import SessionLogError
@@ -46,7 +56,15 @@ def _tool_key(call: ToolCall) -> str:
 
 class Runtime:
     def __init__(
-        self, run: Run, provider: Provider, tools: Tools, limits: Limits, *, journal: RunJournal | None = None
+        self,
+        run: Run,
+        provider: Provider,
+        tools: Tools,
+        limits: Limits,
+        *,
+        journal: RunJournal | None = None,
+        log_replay: bool = False,
+        live_event: tuple[str, dict] = ("run_recovered", {}),
     ):
         self.run = run
         self.provider = provider
@@ -54,9 +72,12 @@ class Runtime:
         self.limits = limits
         self.journal = journal
         self._seq = 0
-        # Replaying: upcoming commands were recorded before a crash and are not repeated.
+        self._applied = 0  # Last command whose result is reflected in the run's state.
+        # Replaying: upcoming commands were recorded earlier and are not repeated.
         self.replaying = journal is not None and journal.last_recorded_seq > 0
-        run._suppress_sink = self.replaying
+        # A recovered run's replayed events are already in its log; a fork's are not.
+        run._suppress_sink = self.replaying and not log_replay
+        self._live_event = live_event
         self._pending: tuple[ToolCall, ...] = ()
         self._busy: str | None = None
         self._model_inflight = False
@@ -70,12 +91,81 @@ class Runtime:
 
     def _go_live(self) -> None:
         """Leave replay before the first command that was not recorded."""
+        if self.journal is not None and self.journal.readonly:
+            raise ReplayExhausted(self._seq, "end of the recorded journal")
         if not self.replaying:
             return
         self.replaying = False
-        self.run._suppress_sink = False
-        self.run._sequence = max(self.run._sequence, self.run._log_sequence)
-        self.run.emit("run_recovered", epoch=self.journal.epoch, recorded_commands=self.journal.last_recorded_seq)
+        if self.run._suppress_sink:
+            self.run._suppress_sink = False
+            self.run._sequence = max(self.run._sequence, self.run._log_sequence)
+        kind, data = self._live_event
+        self.run.emit(kind, **data, epoch=self.journal.epoch, recorded_commands=self.journal.last_recorded_seq)
+
+    @property
+    def seq(self) -> int:
+        """Number of journaled commands whose results are reflected in the run's state."""
+        return self._applied
+
+    def _side_effect(self, name: str, produce) -> Any:
+        self._active()
+        seq = self._next_seq()
+        if self.journal is None:
+            self._applied = seq
+            return produce()
+        key = command_key("side_effect", name)
+        _, completed = self.journal.check(seq, "side_effect", key)
+        if completed is not None:
+            self._applied = seq
+            return completed.payload["value"]
+        self._go_live()
+        value = produce()
+        # Queued without waiting: ordered writes make it durable before any later effect.
+        self.journal.enqueue(JournalEntry(seq=seq, phase="completed", kind="side_effect", key=key,
+                                          payload={"value": value}))
+        self._applied = seq
+        return value
+
+    def now(self) -> datetime:
+        """Current UTC time, recorded: a replay returns the time of the original run."""
+        return datetime.fromisoformat(self._side_effect("now", lambda: datetime.now(UTC).isoformat()))
+
+    def uuid(self) -> str:
+        """A random hex UUID, recorded so that replays return the same one."""
+        return self._side_effect("uuid", lambda: uuid4().hex)
+
+    def random(self) -> float:
+        """A float in [0, 1), recorded so that replays return the same one."""
+        return self._side_effect("random", _random.random)
+
+    def version(self, change_id: str, min_supported: int = 0, max_version: int = 1) -> int:
+        """Choose a code path for a change so that old journals still replay.
+
+        A new execution records and returns ``max_version``. A replay returns the
+        recorded version. A replay of history from before the change existed
+        returns 0, the code as it was before any version() call. Raise
+        ``min_supported`` once journals with older versions no longer need to
+        replay; they then fail with VersionUnsupported and stay recoverable.
+        Markers use no command number, so adding a version() call never shifts
+        later commands.
+        """
+        self._active()
+        if not isinstance(change_id, str) or not change_id:
+            raise ValueError("change_id must be a nonempty string")
+        if not 0 <= min_supported <= max_version:
+            raise ValueError("Versions need 0 <= min_supported <= max_version")
+        if self.journal is None:
+            return max_version
+        recorded = self.journal.markers.get(change_id)
+        if recorded is None:
+            # Recorded commands still ahead: this point was executed by code without the change.
+            recorded = 0 if self._seq < self.journal.last_recorded_seq else max_version
+            if not min_supported <= recorded <= max_version:
+                raise VersionUnsupported(change_id, recorded, min_supported, max_version)
+            self.journal.marker(change_id, recorded, at_seq=self._seq)
+        elif not min_supported <= recorded <= max_version:
+            raise VersionUnsupported(change_id, recorded, min_supported, max_version)
+        return recorded
 
     def _active(self) -> None:
         if self.run.status != "running":
@@ -167,6 +257,7 @@ class Runtime:
                     "model_response", response=response.model_dump(mode="json"),
                     turn=request.turn, purpose=purpose, conversation=conversation,
                 )
+                self._applied = seq
                 return response
             self._go_live()
             if scheduled is None:
@@ -199,6 +290,7 @@ class Runtime:
             "model_response", response=response.model_dump(mode="json"),
             turn=request.turn, purpose=purpose, conversation=conversation,
         )
+        self._applied = seq
         return response
 
     async def execute_tools(self, *, concurrency: int = 1) -> None:
@@ -287,6 +379,7 @@ class Runtime:
                 known[index] if index in known else tasks[index].result() for index in range(len(calls))
             )
         self._pending = ()
+        self._applied = seqs[-1]
 
     def finish(self, output: str) -> None:
         self._idle()

@@ -52,10 +52,42 @@ class NonDeterminismError(RuntimeError):
         self.seq, self.expected, self.actual = seq, expected, actual
 
 
+class VersionUnsupported(NonDeterminismError):
+    """The journal recorded a version of a change that this code no longer supports."""
+
+    def __init__(self, change_id: str, recorded: int, min_supported: int, max_version: int):
+        RuntimeError.__init__(
+            self,
+            f"Change {change_id!r}: journal recorded version {recorded}, code supports {min_supported}..{max_version}",
+        )
+        self.seq, self.expected, self.actual = 0, str(recorded), f"{min_supported}..{max_version}"
+        self.change_id = change_id
+
+
+class ConfigurationChanged(ValueError):
+    """The agent's configuration differs from the one the run was recorded with."""
+
+    def __init__(self, changed: Sequence[str]):
+        super().__init__(
+            f"Configuration changed since the run was recorded: {', '.join(changed)}. "
+            "Pass allow_fingerprint_change=True if the recorded commands still replay."
+        )
+        self.changed = tuple(changed)
+
+
+class ReplayExhausted(Exception):
+    """Inspection replay reached a command it must not perform."""
+
+    def __init__(self, seq: int, reason: str):
+        super().__init__(f"Replay stopped before command {seq}: {reason}")
+        self.seq, self.reason = seq, reason
+
+
 class JournalEntry(Record):
     seq: int = Field(ge=1)
-    phase: Literal["scheduled", "completed"]
-    kind: Literal["model", "tool"]
+    # A marker (a version() decision) is found by its key, not by its position.
+    phase: Literal["scheduled", "completed", "marker"]
+    kind: Literal["model", "tool", "side_effect", "version"]
     key: str
     payload: dict[str, JsonValue] = Field(default_factory=dict)
 
@@ -83,6 +115,7 @@ def command_key(kind: str, value: Any) -> str:
 @dataclass(frozen=True)
 class _CreateRun:
     record: RunRecord
+    entries: tuple[JournalEntry, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -143,7 +176,8 @@ class _Committer:
         self._worker: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
-    async def submit(self, op: Any) -> Any:
+    def enqueue(self, op: Any) -> asyncio.Future:
+        """Queue an op without waiting. Ops are written in the order they were queued."""
         loop = asyncio.get_running_loop()
         if self._loop is not loop:
             self._loop, self._queue, self._worker = loop, [], None
@@ -151,7 +185,10 @@ class _Committer:
         self._queue.append((op, future))
         if self._worker is None or self._worker.done():
             self._worker = loop.create_task(self._drain(), name="journal-committer")
-        return await future
+        return future
+
+    async def submit(self, op: Any) -> Any:
+        return await self.enqueue(op)
 
     async def _drain(self) -> None:
         while self._queue:
@@ -204,6 +241,8 @@ def _apply(tx: _Tx, op: Any) -> Any:
         if tx.get_run(op.record.session_id, op.record.run_id) is not None:
             raise JournalError(f"Run {op.record.run_id} already exists")
         tx.put_run(op.record)
+        if op.entries:  # A fork starts with its copied prefix, atomically.
+            tx.insert_entries(op.record.session_id, op.record.run_id, op.record.epoch, op.entries)
         return op.record.epoch
     if isinstance(op, _ClaimRun):
         record = tx.get_run(op.session_id, op.run_id)
@@ -297,8 +336,8 @@ class DurableStore:
         await self._committer.submit(_SaveSession(session))
 
     # Runs and journal -----------------------------------------------------
-    async def create_run(self, record: RunRecord) -> None:
-        await self._committer.submit(_CreateRun(record))
+    async def create_run(self, record: RunRecord, entries: Iterable[JournalEntry] = ()) -> None:
+        await self._committer.submit(_CreateRun(record, tuple(entries)))
 
     async def claim_run(self, session_id: str, run_id: str, *, ttl: float, force: bool = False) -> int:
         """Take ownership of a running run; returns the new epoch."""
@@ -307,6 +346,11 @@ class DurableStore:
 
     async def append(self, session_id: str, run_id: str, epoch: int, entries: Iterable[JournalEntry]) -> None:
         await self._committer.submit(_Append(session_id, run_id, epoch, tuple(entries)))
+
+    def enqueue_append(
+        self, session_id: str, run_id: str, epoch: int, entries: Iterable[JournalEntry]
+    ) -> asyncio.Future:
+        return self._committer.enqueue(_Append(session_id, run_id, epoch, tuple(entries)))
 
     async def heartbeat(self, session_id: str, run_id: str, epoch: int, *, ttl: float, active_seconds: float) -> None:
         await self._committer.submit(_Heartbeat(session_id, run_id, epoch, time.time() + ttl, active_seconds))
@@ -402,7 +446,8 @@ class MemoryStore(DurableStore):
 
     def journal(self, session_id, run_id):
         entries = self.data.entries.get((session_id, run_id), {})
-        return [entries[key] for key in sorted(entries, key=lambda key: (key[0], key[1] != "scheduled"))]
+        order = {"scheduled": 0, "completed": 1, "marker": 2}
+        return [entries[key] for key in sorted(entries, key=lambda key: (key[1] == "marker", key[0], order[key[1]]))]
 
     def load(self, session_id):
         validate_session_id(session_id)
@@ -619,24 +664,70 @@ class SqliteStore(DurableStore):
 
 # Per-run view used by Runtime ------------------------------------------------
 class RunJournal:
-    """One owner's view of a run's journal: recorded entries plus appends at its epoch."""
+    """One owner's view of a run's journal: recorded entries plus appends at its epoch.
+
+    ``readonly`` (inspection) never writes; reaching an unrecorded command, or one
+    past ``until_seq``, raises ReplayExhausted. Up to ``lenient_until`` (a fork's
+    copied prefix) recorded results match by position and kind, not by key.
+    """
 
     def __init__(
-        self, store: DurableStore, session_id: str, run_id: str, epoch: int, entries: Iterable[JournalEntry] = ()
+        self,
+        store: DurableStore | None,
+        session_id: str,
+        run_id: str,
+        epoch: int,
+        entries: Iterable[JournalEntry] = (),
+        *,
+        readonly: bool = False,
+        until_seq: int | None = None,
+        lenient_until: int = 0,
     ):
         self.store, self.session_id, self.run_id, self.epoch = store, session_id, run_id, epoch
-        self._recorded = {(entry.seq, entry.phase): entry for entry in entries}
+        self.readonly, self.until_seq, self.lenient_until = readonly, until_seq, lenient_until
+        entries = list(entries)
+        self._recorded = {(e.seq, e.phase): e for e in entries if e.phase != "marker"}
+        self.markers: dict[str, int] = {e.key: e.payload["version"] for e in entries if e.phase == "marker"}
+        self._next_marker = max((e.seq for e in entries if e.phase == "marker"), default=0) + 1
         self.last_recorded_seq = max((seq for seq, _ in self._recorded), default=0)
+        self._queued: list[asyncio.Future] = []
 
     def recorded(self, seq: int) -> tuple[JournalEntry | None, JournalEntry | None]:
         return self._recorded.get((seq, "scheduled")), self._recorded.get((seq, "completed"))
 
     def check(self, seq: int, kind: str, key: str) -> tuple[JournalEntry | None, JournalEntry | None]:
+        if self.until_seq is not None and seq > self.until_seq:
+            raise ReplayExhausted(seq, f"until_seq={self.until_seq}")
         scheduled, completed = self.recorded(seq)
+        lenient = seq <= self.lenient_until
         for entry in (scheduled, completed):
-            if entry is not None and (entry.kind != kind or entry.key != key):
+            if entry is not None and (entry.kind != kind or (entry.key != key and not lenient)):
                 raise NonDeterminismError(seq, f"{entry.kind} {entry.key}", f"{kind} {key}")
         return scheduled, completed
 
     async def append(self, *entries: JournalEntry) -> None:
+        if self.readonly:
+            raise ReplayExhausted(entries[0].seq, "inspection replay does not write")
+        await self.flush()
         await self.store.append(self.session_id, self.run_id, self.epoch, entries)
+
+    def enqueue(self, *entries: JournalEntry) -> None:
+        """Queue entries without waiting; a later append or flush() reports failures."""
+        if self.readonly:
+            return
+        future = self.store.enqueue_append(self.session_id, self.run_id, self.epoch, entries)
+        future.add_done_callback(lambda f: f.cancelled() or f.exception())  # Retrieved by flush().
+        self._queued.append(future)
+
+    async def flush(self) -> None:
+        queued, self._queued = self._queued, []
+        for future in queued:
+            await future
+
+    def marker(self, change_id: str, version: int, *, at_seq: int) -> None:
+        self.markers[change_id] = version
+        # at_seq: commands issued before the decision, so a fork copies only its prefix's markers.
+        entry = JournalEntry(seq=self._next_marker, phase="marker", kind="version", key=change_id,
+                             payload={"version": version, "at_seq": at_seq})
+        self._next_marker += 1
+        self.enqueue(entry)

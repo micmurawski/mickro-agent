@@ -1,6 +1,6 @@
 """Small agent loops, explicit state, and typed tools."""
 
-from .agent import Agent, Worker
+from .agent import Agent, Replay, Worker
 from .agent_tools import AGENT_JOB_TOOLS, AgentJobs, agent_call_tool_factory, agent_tool
 from .context_ops import (
     CompactionProposal,
@@ -18,15 +18,18 @@ from .context_ops import (
 )
 from .flow import END, Flow, Node, node
 from .journal import (
+    ConfigurationChanged,
     DurableStore,
     JournalEntry,
     JournalError,
     MemoryStore,
     NonDeterminismError,
+    ReplayExhausted,
     RunLeaseHeld,
     RunOwnershipLost,
     RunRecord,
     SqliteStore,
+    VersionUnsupported,
 )
 from .loops import PlanThenAct, ReAct, ReActWithSummary, finish_step, model_step, react_flow, tools_step
 from .providers.base import ApiHandler
@@ -50,6 +53,10 @@ from .types import (
 from .viz import build_dot, build_mermaid, render_graph, to_png
 
 __all__ = [
+    "VersionUnsupported",
+    "ReplayExhausted",
+    "Replay",
+    "ConfigurationChanged",
     "Worker",
     "SqliteStore",
     "RunRecord",

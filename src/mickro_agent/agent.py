@@ -8,17 +8,26 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from .history import validate_history as _validate_history
-from .journal import DurableStore, JournalEntry, JournalError, NonDeterminismError, RunJournal, RunRecord
+from .journal import (
+    ConfigurationChanged,
+    DurableStore,
+    JournalEntry,
+    JournalError,
+    NonDeterminismError,
+    ReplayExhausted,
+    RunJournal,
+    RunRecord,
+)
 from .loops import ReAct
 from .runtime import LimitReached, Loop, Provider, Runtime
 from .session_log import SessionLog, SessionLogError, validate_session_id
 from .sessions import MemorySessionStore, Session, SessionStore
 from .tools import Tools
-from .types import Limits, Message, Run
+from .types import Limits, Message, Run, ToolCall
 
 # Failures after which the journal must be left as it is: another owner may hold
 # the run, the store is unavailable, or this code cannot replay the run.
@@ -62,8 +71,8 @@ def _checkpoint_messages(run: Run) -> tuple[Message, ...]:
     return tuple(messages)
 
 
-def _fingerprint(agent: Agent) -> str:
-    """Hash of the configuration a journal was recorded with (checked in a later phase)."""
+def _fingerprint(agent: Agent) -> dict[str, str]:
+    """Hash per configuration part a journal was recorded with, so a mismatch can name the part."""
     flow = None
     to_flow = getattr(agent.loop, "to_flow", None)
     if callable(to_flow):
@@ -81,7 +90,17 @@ def _fingerprint(agent: Agent) -> str:
         "provider": type(agent.provider).__name__,
         "model": model if isinstance(model := getattr(agent.provider, "model", None), str) else None,
     }
-    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+    return {
+        name: hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
+        for name, value in body.items()
+    }
+
+
+def _changed_parts(recorded: Mapping[str, Any], current: Mapping[str, str]) -> list[str]:
+    parts = recorded.get("fingerprint")
+    if not isinstance(parts, Mapping):
+        return []  # Recorded before fingerprints were checked.
+    return sorted(name for name in set(parts) | set(current) if parts.get(name) != current.get(name))
 
 
 @dataclass(frozen=True)
@@ -89,6 +108,25 @@ class _Recovery:
     epoch: int
     entries: tuple[JournalEntry, ...]
     active_seconds: float
+    lenient_until: int = 0
+    log_replay: bool = False
+    live_event: tuple[str, dict] = ("run_recovered", {})
+
+
+@dataclass(frozen=True)
+class Replay:
+    """A run rebuilt from its journal without performing any effect.
+
+    ``run`` holds the messages, state, usage and events as of ``commands`` replayed
+    commands. ``reason`` says why replay stopped: ``finished`` (the loop ended),
+    ``until_seq`` (the requested step), or ``end_of_journal`` (the next command was
+    never recorded, e.g. the run was interrupted there).
+    """
+
+    run: Run
+    commands: int
+    reason: Literal["finished", "until_seq", "end_of_journal"]
+    pending_tool_calls: tuple[ToolCall, ...]
 
 
 @dataclass(frozen=True)
@@ -195,7 +233,12 @@ class Agent:
             )
 
     async def recover(
-        self, session_id: str, *, context: Mapping[str, Any] | None = None, force: bool = False
+        self,
+        session_id: str,
+        *,
+        context: Mapping[str, Any] | None = None,
+        force: bool = False,
+        allow_fingerprint_change: bool = False,
     ) -> Run:
         """Resume the session's interrupted run from its journal.
 
@@ -203,6 +246,11 @@ class Agent:
         Supply ``context`` again: live resources are never journaled. ``force``
         takes over a run whose previous owner still holds an unexpired lease;
         use it only when that owner is known to be gone.
+
+        A configuration that differs from the recorded one (loop, flow, tools,
+        provider, model) raises ConfigurationChanged, naming the parts. With
+        ``allow_fingerprint_change`` recovery proceeds; commands that no longer
+        match the journal still raise NonDeterminismError.
         """
         if self.store is None:
             raise ValueError("recover() requires an Agent with a durable store")
@@ -215,23 +263,154 @@ class Agent:
             start = record.start
             if record.agent != self.name or start.get("system_prompt") != self.system_prompt:
                 raise ValueError("Run belongs to a different agent configuration")
+            changed = _changed_parts(start, _fingerprint(self))
+            if changed and not allow_fingerprint_change:
+                raise ConfigurationChanged(changed)
             epoch = await self.store.claim_run(session_id, record.run_id, ttl=self.lease_ttl, force=force)
-            run = Run(
-                id=record.run_id,
-                session_id=session_id,
-                parent_session_id=start.get("parent_session_id"),
-                parent_run_id=start.get("parent_run_id"),
-                job_id=start.get("job_id"),
-                context=dict(context or {}),
-                messages=[Message.model_validate(message) for message in start["messages"]],
-            )
+            run = self._run_from_record(record, context)
             log_path = start.get("log_path")
             return await self._execute(
                 run,
                 directory=Path(log_path).parent if log_path else None,
                 resume_log=True,
-                recovery=_Recovery(epoch, tuple(self.store.journal(session_id, record.run_id)), record.active_seconds),
+                recovery=_Recovery(
+                    epoch,
+                    tuple(self.store.journal(session_id, record.run_id)),
+                    record.active_seconds,
+                    lenient_until=_lenient_until(start),
+                ),
             )
+
+    async def replay(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        until_seq: int | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Replay:
+        """Rebuild a run's state from its journal, optionally only up to command ``until_seq``.
+
+        Nothing is written and no provider or tool is called. Use it to inspect a
+        finished or interrupted run at any step. Code that diverges from the
+        journal raises NonDeterminismError. A parallel tool batch is replayed
+        whole: ``until_seq`` inside a batch stops before the batch.
+        """
+        if self.store is None:
+            raise ValueError("replay() requires an Agent with a durable store")
+        if until_seq is not None and until_seq < 0:
+            raise ValueError("until_seq must be nonnegative")
+        record = self.store.get_run(session_id, run_id)
+        if record is None:
+            raise ValueError(f"Run {run_id} not found in session {session_id}")
+        run = self._run_from_record(record, context)
+        journal = RunJournal(
+            None, session_id, run_id, record.epoch, self.store.journal(session_id, run_id),
+            readonly=True, until_seq=until_seq, lenient_until=_lenient_until(record.start),
+        )
+        runtime = Runtime(run, self.provider, self.tools, self.limits, journal=journal)
+        reason = "finished"
+        try:
+            await self.loop.run(runtime)
+        except ReplayExhausted as exc:
+            reason = "until_seq" if exc.reason.startswith("until_seq") else "end_of_journal"
+        except LimitReached as exc:
+            run.status, run.error = "limit", str(exc)
+        except NonDeterminismError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - A replayed failure is part of the inspected state.
+            run.status, run.error = "failed", f"{type(exc).__name__}: {exc}"
+        return Replay(run, runtime.seq, reason, tuple(runtime._pending))
+
+    async def fork(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        at_seq: int,
+        context: Mapping[str, Any] | None = None,
+        new_session_id: str | None = None,
+    ) -> Run:
+        """Start a new run that reuses a recorded run's first ``at_seq`` commands, then runs live.
+
+        Call it on an agent with the configuration to try, e.g.
+        ``replace(agent, provider=other).fork(...)``. Recorded results of the
+        prefix are reused by position, so a changed system prompt or tool set does
+        not invalidate them. The fork gets its own session (``new_session_id`` or a
+        fresh ID) and its own journal, so it can itself be recovered or forked.
+        """
+        if self.store is None:
+            raise ValueError("fork() requires an Agent with a durable store")
+        if at_seq < 0:
+            raise ValueError("at_seq must be nonnegative")
+        source = self.store.get_run(session_id, run_id)
+        if source is None:
+            raise ValueError(f"Run {run_id} not found in session {session_id}")
+        new_session_id = uuid4().hex if new_session_id is None else new_session_id
+        validate_session_id(new_session_id)
+        entries = []
+        for entry in self.store.journal(session_id, run_id):
+            if entry.phase == "marker":
+                if entry.payload.get("at_seq", 0) <= at_seq:
+                    entries.append(entry)
+            elif entry.seq <= at_seq:
+                entries.append(entry)
+        forked_from = {"session_id": session_id, "run_id": run_id, "at_seq": at_seq}
+        async with self.sessions.lock(new_session_id):
+            if self.sessions.load(new_session_id) is not None or self.store.runs(session_id=new_session_id):
+                raise ValueError(f"Session {new_session_id} already exists")
+            recorded = [Message.model_validate(message) for message in source.start["messages"]]
+            if recorded and recorded[0].role == "system":
+                recorded[0] = Message(role="system", content=self.system_prompt)
+            run = Run(session_id=new_session_id, context=dict(context or {}), messages=recorded)
+            await self.store.create_run(
+                RunRecord(
+                    session_id=run.session_id,
+                    run_id=run.id,
+                    agent=self.name,
+                    owner=self.store.owner_id,
+                    epoch=1,
+                    lease_expires_at=time.time() + self.lease_ttl,
+                    start={**self._start(run), "forked_from": forked_from},
+                ),
+                entries,
+            )
+            return await self._execute(
+                run,
+                directory=self.log_dir,
+                resume_log=False,
+                recovery=_Recovery(
+                    1, tuple(entries), 0.0, lenient_until=at_seq, log_replay=True,
+                    live_event=("fork_live", {"forked_from": forked_from}),
+                ),
+                forked_from=forked_from,
+            )
+
+    def _start(self, run: Run) -> dict:
+        return {
+            "system_prompt": self.system_prompt,
+            "messages": [message.model_dump(mode="json") for message in run.messages],
+            "limits": self.limits.model_dump(mode="json"),
+            "loop": type(self.loop).__name__,
+            "fingerprint": _fingerprint(self),
+            "log_path": str(run.log_path) if run.log_path else None,
+            "parent_session_id": run.parent_session_id,
+            "parent_run_id": run.parent_run_id,
+            "job_id": run.job_id,
+        }
+
+    @staticmethod
+    def _run_from_record(record: RunRecord, context: Mapping[str, Any] | None) -> Run:
+        start = record.start
+        return Run(
+            id=record.run_id,
+            session_id=record.session_id,
+            parent_session_id=start.get("parent_session_id"),
+            parent_run_id=start.get("parent_run_id"),
+            job_id=start.get("job_id"),
+            context=dict(context or {}),
+            messages=[Message.model_validate(message) for message in start["messages"]],
+        )
 
     def _session(self, run: Run, status: str) -> Session:
         return Session(
@@ -264,7 +443,13 @@ class Agent:
                 return
 
     async def _execute(
-        self, run: Run, *, directory: str | Path | None, resume_log: bool, recovery: _Recovery | None = None
+        self,
+        run: Run,
+        *,
+        directory: str | Path | None,
+        resume_log: bool,
+        recovery: _Recovery | None = None,
+        forked_from: dict | None = None,
     ) -> Run:
         journal: RunJournal | None = None
         heartbeat: asyncio.Task | None = None
@@ -279,7 +464,7 @@ class Agent:
         with ExitStack() as stack:
             if directory is not None:
                 session_log = stack.enter_context(
-                    SessionLog(directory, run.session_id, resume=resume_log, repair=recovery is not None)
+                    SessionLog(directory, run.session_id, resume=resume_log, repair=recovery is not None and resume_log)
                 )
                 run.log_path = session_log.path
                 run._event_sink = session_log.write
@@ -295,27 +480,23 @@ class Agent:
                                 owner=self.store.owner_id,
                                 epoch=1,
                                 lease_expires_at=time.time() + self.lease_ttl,
-                                start={
-                                    "system_prompt": self.system_prompt,
-                                    "messages": [message.model_dump(mode="json") for message in run.messages],
-                                    "limits": self.limits.model_dump(mode="json"),
-                                    "loop": type(self.loop).__name__,
-                                    "fingerprint": _fingerprint(self),
-                                    "log_path": str(run.log_path) if run.log_path else None,
-                                    "parent_session_id": run.parent_session_id,
-                                    "parent_run_id": run.parent_run_id,
-                                    "job_id": run.job_id,
-                                },
+                                start=self._start(run),
                             )
                         )
                         journal = RunJournal(self.store, run.session_id, run.id, 1)
                     else:
-                        journal = RunJournal(self.store, run.session_id, run.id, recovery.epoch, recovery.entries)
+                        journal = RunJournal(
+                            self.store, run.session_id, run.id, recovery.epoch, recovery.entries,
+                            lenient_until=recovery.lenient_until,
+                        )
                     heartbeat = asyncio.create_task(self._heartbeat(journal, active), name=f"heartbeat-{run.id}")
                 else:
                     # Without a journal, a "running" checkpoint is how a crash is detected later.
                     await self._checkpoint(run, "running")
-                runtime = Runtime(run, self.provider, self.tools, self.limits, journal=journal)
+                runtime = Runtime(
+                    run, self.provider, self.tools, self.limits, journal=journal,
+                    **({"log_replay": recovery.log_replay, "live_event": recovery.live_event} if recovery else {}),
+                )
                 model = getattr(self.provider, "model", None)
                 run.emit(
                     "run_start",
@@ -330,6 +511,7 @@ class Agent:
                     parent_session_id=run.parent_session_id,
                     parent_run_id=run.parent_run_id,
                     job_id=run.job_id,
+                    **({"forked_from": forked_from} if forked_from else {}),
                 )
                 # The timeout budget counts active execution only, not downtime between crash and recovery.
                 async with asyncio.timeout(max(self.limits.timeout - active_before, 0)):
@@ -379,6 +561,8 @@ class Agent:
                         run.emit("run_end", status=run.status, output=run.output, error=run.error, usage=run.usage)
                     finally:
                         run._event_sink = None
+                        if journal is not None:
+                            await journal.flush()  # Queued side effects precede the final status.
                         if journal is None:
                             await self._checkpoint(run, run.status)
                         elif self.sessions is self.store:
@@ -402,6 +586,11 @@ class Agent:
                             )
                             await self._checkpoint(run, run.status)
         return run
+
+
+def _lenient_until(start: Mapping[str, Any]) -> int:
+    forked_from = start.get("forked_from")
+    return forked_from.get("at_seq", 0) if isinstance(forked_from, Mapping) else 0
 
 
 class Worker:
@@ -431,7 +620,9 @@ class Worker:
         self.context = context
         self.concurrency = concurrency
 
-    async def recover_all(self, *, force: bool = False) -> list[Run | BaseException]:
+    async def recover_all(
+        self, *, force: bool = False, allow_fingerprint_change: bool = False
+    ) -> list[Run | BaseException]:
         """Recover all running runs; results are in store order, failures as exceptions.
 
         On a single host, ``force=True`` at startup is safe: no other process can
@@ -445,7 +636,9 @@ class Worker:
                 raise ValueError(f"No agent named {record.agent!r} for run {record.run_id}")
             context = self.context(record) if callable(self.context) else self.context
             async with semaphore:
-                return await agent.recover(record.session_id, context=context, force=force)
+                return await agent.recover(
+                    record.session_id, context=context, force=force, allow_fingerprint_change=allow_fingerprint_change
+                )
 
         records = self.store.runs(status="running")
         return await asyncio.gather(*(recover(record) for record in records), return_exceptions=True)

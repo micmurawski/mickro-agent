@@ -635,6 +635,29 @@ journal write. A recovered run whose code issues different commands than the jou
 recorded raises `NonDeterminismError`, and the run stays recoverable. Loop and node
 code must therefore be deterministic; nondeterminism belongs in tools.
 
+Loop code that needs time or randomness gets them from the runtime, so that a replay
+returns the original values. `runtime.version(change_id)` lets old journals keep their
+old code path after you change a loop:
+
+```python
+stamp = runtime.now()          # also runtime.uuid(), runtime.random()
+if runtime.version("double-check") == 1:
+    runtime.say("Double-check your work.")
+```
+
+A recorded run can also be inspected or forked, without repeating any effect:
+
+```python
+step = await agent.replay(session_id, run_id, until_seq=3)    # state after 3 commands
+step.run.messages, step.pending_tool_calls, step.reason
+
+other = replace(agent, provider=other_provider, system_prompt="Be brief.")
+fork = await other.fork(session_id, run_id, at_seq=3)  # reuse 3 commands, then run live
+```
+
+Recovery under a changed configuration (loop, flow, tools, provider or model) raises
+`ConfigurationChanged`, naming the parts; `allow_fingerprint_change=True` proceeds.
+
 The timeout budget counts active time only, not downtime between a crash and recovery.
 With a store, session checkpoints live in the same file and are committed together
 with each run's outcome. `MemoryStore` offers the same behaviour in memory, for tests.

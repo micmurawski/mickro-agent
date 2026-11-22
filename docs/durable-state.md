@@ -1,7 +1,8 @@
 # Durable agent state
 
-Status: phase 1 (journal and recovery) implemented in
-[journal.py](../src/mickro_agent/journal.py); the rest is design. Scope: the Python
+Status: phases 1–2 (journal, recovery, determinism, replay and forks) are implemented
+in [journal.py](../src/mickro_agent/journal.py), [runtime.py](../src/mickro_agent/runtime.py)
+and [agent.py](../src/mickro_agent/agent.py); the rest is design. Scope: the Python
 package (`src/mickro_agent`).
 The Rust crate follows later against the same storage schema.
 
@@ -207,22 +208,43 @@ which matters when a host is down for hours during a weeks-long project.
 ### 4.6 Determinism APIs
 
 ```python
-runtime.now() -> datetime          # journaled
-runtime.uuid() -> str              # journaled
-runtime.random() -> float          # journaled
-await runtime.sleep(seconds)       # durable timer
-await runtime.wait_signal(name, timeout=None)
-runtime.version("change-id", min_supported, max_version) -> int
+runtime.now() -> datetime          # journaled (phase 2)
+runtime.uuid() -> str              # journaled (phase 2)
+runtime.random() -> float          # journaled (phase 2)
+runtime.version("change-id", min_supported=0, max_version=1) -> int   # phase 2
+await runtime.sleep(seconds)       # durable timer (phase 7)
+await runtime.wait_signal(name, timeout=None)                         # phase 7
 ```
 
-`runtime.version` works like Temporal's `patched`. In live mode it records and returns
-`max_version`. In replay it returns the recorded value. When replaying history from
-before the marker existed, it returns `min_supported`. Code branches on the result, so
-old journals keep replaying after the code changes.
+**Side effects.** `now`, `uuid` and `random` are commands with a number, like
+Temporal's `SideEffect`. They are synchronous, so sync nodes can use them too. Their
+journal row is queued without waiting. The committer writes in submission order, so a
+later effect that depends on the value (a model call, a tool) can only be durable if
+the value is.
+
+**`runtime.version`** works like Temporal's `patched` / `getVersion`.
+
+- A new execution records and returns `max_version`.
+- A replay returns the recorded version.
+- A replay of history recorded **before the change existed** returns **0**, meaning
+  "the code as it was before any `version()` call". This applies when the call is
+  reached while recorded commands are still ahead.
+- When the returned version is outside `min_supported..max_version`, it raises
+  `VersionUnsupported`, a `NonDeterminismError`, and the run stays recoverable. Raise
+  `min_supported` once journals with older versions no longer need to replay.
+- Markers are stored by change ID and **use no command number**. Adding a `version()`
+  call therefore never shifts later commands. Each marker records `at_seq`, so a fork
+  copies only the markers of its prefix.
+
+```python
+if runtime.version("double-check") == 1:
+    runtime.say("Double-check your work.")      # new code path
+```
 
 ### 4.7 Fingerprint
 
-`start.fingerprint` (on the run record) holds a hash of:
+`start.fingerprint` (on the run record) holds a separate hash per part, so an error can
+name what changed:
 
 - the agent name,
 - the loop's qualified name,
@@ -231,25 +253,54 @@ old journals keep replaying after the code changes.
 - the system prompt,
 - provider type and model name.
 
-When the fingerprint differs, **recovery** fails unless
-`allow_fingerprint_change=True`; version markers should handle intended changes.
-**Inspection** replay only warns. A **fork** records the new fingerprint.
+When a part differs, **recovery** raises `ConfigurationChanged(changed=("provider",))`
+unless `allow_fingerprint_change=True`. The agent name and system prompt must always
+match, because the session belongs to them.
+
+Allowing a change helps only when the recorded commands still match. Tool specs and
+the system prompt are part of every model request's hash, so changing them makes
+recovery raise `NonDeterminismError` at the first model call. Changing the provider or
+the model, or loop internals behind `version()`, does not.
+
+**Inspection** replay does not check the fingerprint; divergence shows up as
+`NonDeterminismError`. A **fork** records its own fingerprint.
 
 ## 5. Replay modes
 
-| Mode | API | Live effects | Mismatch check |
+| Mode | API | Live effects | Prefix check |
 |---|---|---|---|
-| Recovery | `await agent.recover(session_id, context=...)` | after the end of the journal | strict |
-| Inspection | `await agent.replay(session_id, run_id, until_seq=N)` | none (`ReplayExhausted`) | strict |
-| Fork | `await agent.fork(session_id, run_id, at_seq=N, **overrides)` | after N | strict up to N, none after |
+| Recovery | `await agent.recover(session_id, context=...)` | after the end of the journal | strict (kind and key) |
+| Inspection | `await agent.replay(session_id, run_id, until_seq=N)` | none | strict |
+| Fork | `await replace(agent, ...).fork(session_id, run_id, at_seq=N)` | after command N | lenient up to N (kind only), strict after |
 
-- **Recovery** needs `context` (live resources are never journaled), so the caller
-  passes it again. `Worker(store, agents).recover_all()` resumes every run in the
-  `running` state on startup.
-- **Inspection** returns a `Run` frozen at step N, with `messages`, `state`, pending
-  tool calls, and the shared-state view at the offsets the run had read.
-- **Fork** creates a new `run_id` with `forked_from_run` and `forked_at_seq`. Overrides
-  can include `provider`, `system_prompt`, `tools` and `loop`.
+**Recovery.** It needs `context` again, because live resources are never journaled.
+`Worker(store, agents).recover_all()` resumes every run in the `running` state on
+startup.
+
+**Inspection** returns `Replay(run, commands, reason, pending_tool_calls)`:
+
+- It never writes, and never calls a provider or tool.
+- `run` holds the messages, `state`, usage and events after `commands` commands.
+- `reason` is `finished` (the loop ended), `until_seq` (the requested step), or
+  `end_of_journal` (the next command was never recorded, e.g. an interrupted run).
+- A parallel tool batch is replayed whole: an `until_seq` that falls inside a batch
+  stops before it.
+- A replayed failure, such as a limit or an error raised by a node, becomes part of
+  the inspected state.
+- The shared-state view at the offsets the run had read comes with phase 3.
+
+**Fork.** Call it on an agent with the configuration to try, e.g.
+`replace(agent, provider=other, system_prompt=...)`.
+
+- The fork gets a **new session** (`new_session_id` or a fresh ID) and a run record
+  with `start.forked_from = {session_id, run_id, at_seq}`.
+- Its first `at_seq` commands, and the version markers decided within them, are
+  copied into its own journal atomically with its creation.
+- The prefix is matched **by position and kind only**, so a changed system prompt or
+  tool set does not invalidate the recorded results.
+- After the prefix it runs live and logs a `fork_live` event.
+- A fork is an ordinary durable run: it can be recovered (still lenient up to
+  `at_seq`), replayed and forked again. `at_seq=0` reruns from the original input.
 
 ## 6. Shared state
 
@@ -822,11 +873,16 @@ replays are deterministic. Phases 1–2 are the durable-run core and come first.
      examples. Each recovered run has the same output and messages as an uninterrupted
      run, and the side-effect counter for `unsafe` and `idempotent` tools is correct.
      Plus: 200 concurrent scripted runs, a crash, then `recover_all`.
-2. **Determinism, replay and fork**
-   - Work: `now`, `uuid`, `random`, `version`; fingerprint; `NonDeterminismError`;
-     `replay(until_seq)`; `fork(at_seq)`.
-   - Tests: edited loops fail recovery, `version` branches keep old journals
-     replayable, and a fork with a different scripted provider diverges only after N.
+2. **Determinism, replay and fork** (done)
+   - Work: `now`, `uuid`, `random`, `version`; per-part fingerprint and
+     `ConfigurationChanged`; `replay(until_seq)`; `fork(at_seq)`.
+   - Tests:
+     - a crash at every write never changes the recorded side-effect values;
+     - `version` keeps old journals replayable, and `min_supported` rejects them;
+     - a changed provider is named, and allowing it continues the run;
+     - replay at every step performs no write and no effect;
+     - a fork with a different provider and system prompt reuses its prefix, diverges
+       after it, and can itself be recovered.
 3. **Shared tree core**
    - Work: `SharedBackend` (memory and SQLite), log, snapshots, JSON Pointer and Patch,
      versions, journaled reads, `based_on`, provenance, the conformance suite.
